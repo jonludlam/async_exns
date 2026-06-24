@@ -26,13 +26,18 @@ see it again). We call these "asynchronous exceptions" below.
   (plus `Out_of_memory` in its synchronous, non-GC form, which the design doc keeps
   as an ordinary exception). A test framework runs arbitrary, possibly deeply
   recursive user code, so `Stack_overflow` from inside a test is realistic.
-- **Alcotest is a per-test recovery loop, and that is what the change affects.** Each
-  test runs inside a wildcard catch
-  ([`protect_test`](https://github.com/mirage/alcotest/blob/b26e58f62c93895f24a5ee48b550f274db74ee55/src/alcotest-engine/core.ml#L183-L195))
-  that turns *any* exception — today including `Stack_overflow` — into a recorded
-  "this test raised an exception" result, after which the loop continues to the next
-  test. Under OxCaml an asynchronous `Stack_overflow` no longer matches that wildcard:
-  instead of one failed test, **the whole run aborts**. This is a real behaviour change.
+- **Alcotest is a per-test recovery loop, and that is what the change can affect — but
+  whether it does depends on the runner.** Each test runs inside
+  [`protect_test`](https://github.com/mirage/alcotest/blob/b26e58f62c93895f24a5ee48b550f274db74ee55/src/alcotest-engine/core.ml#L183-L195),
+  which catches the test's exception via the concurrency monad's `M.catch`, records it as
+  a failed test, and lets the loop continue. That catch is **not** a fixed wildcard — it
+  is whatever the engine was instantiated with, and the backends differ on `Stack_overflow`:
+  - **default synchronous runner** (identity monad) and **`alcotest-async`** catch
+    `Stack_overflow` today, so under OxCaml it stops being caught and **the whole run
+    aborts instead of recording one failed test** — a real behaviour change.
+  - **`alcotest-lwt`** uses `Lwt.catch`, whose default exception filter already declines
+    `Stack_overflow`, so that runner already aborts on a stack-overflowing test today —
+    **no change** (see "Which exceptions are affected").
 - **The clean-up that an asynchronous `Stack_overflow` would skip is the restoration
   of the program's redirected standard output/error.** For each test, Alcotest
   redirects the operating-system stdout/stderr to a per-test log file and restores
@@ -125,10 +130,32 @@ becomes one failed test — it flies past `protect_test`, past the whole runner 
 promise — "one test blowing up still lets the rest of the suite run and report" — is
 broken for `Stack_overflow`.
 
-The Lwt and Async variants are the same in spirit: they instantiate the same engine, so
-the same `protect_test` wildcard wraps each test. There the `M.catch` is `Lwt.catch` /
-Async's `try_with`, which today also turn a synchronous `Stack_overflow` inside the test
-thunk into a recorded failure; under OxCaml it bypasses them in the same way.
+The Lwt and Async variants instantiate the *same* engine, so the same `protect_test`
+wraps each test — but `M.catch` is now the concurrency library's own catch, and its
+behaviour for `Stack_overflow` is **not** the same as the identity monad's, so the
+backends have to be treated separately:
+
+- **`alcotest-async`** instantiates the engine with a `Promise` module whose `catch` is
+  [`try_with t >>= function Ok a -> return a | Error exn -> on_error exn`](https://github.com/mirage/alcotest/blob/b26e58f62c93895f24a5ee48b550f274db74ee55/src/alcotest-async/alcotest_async.ml#L11-L19).
+  Async's `try_with` runs the test inside a monitor that captures *all* exceptions, with
+  no exclusion for the runtime ones, so today a `Stack_overflow` becomes a recorded
+  failure just as in the synchronous case — and under OxCaml it bypasses the monitor the
+  same way. So the change applies here too. (Async's monitor internals were not read
+  directly here; this rests on `try_with` having no `Stack_overflow` exclusion, which is
+  worth a quick confirmation.)
+- **`alcotest-lwt`** instantiates the engine with the `Lwt` module directly, so `M.catch`
+  is `Lwt.catch`. Crucially, `Lwt.catch` guards its call with
+  [`try f () with exn when Exception_filter.run exn -> fail exn`](https://github.com/ocsigen/lwt/blob/59daedd52c76eeca65e6198e4196660845177458/src/core/lwt.ml#L2026-L2029),
+  and Lwt's **default** filter
+  ([`handle_all_except_runtime`](https://github.com/ocsigen/lwt/blob/59daedd52c76eeca65e6198e4196660845177458/src/core/lwt.ml#L715-L722))
+  returns `false` for `Stack_overflow` and `Out_of_memory`. So `Lwt.catch` does **not**
+  catch a stack-overflowing test *today*: it already flies past `protect_test`, and an
+  `alcotest-lwt` run already aborts on such a test. The new model therefore changes
+  **nothing** about per-test recovery for `alcotest-lwt` — and note that adding a
+  `Sys.with_async_exns` wrapper would not restore recovery either, because the converted
+  exception is still `Stack_overflow`, which Lwt's default filter still declines. (The
+  shared top-level Cmdliner `~catch`, an ordinary wildcard, is the one place even the Lwt
+  run's behaviour shifts — see that row below.)
 
 ### What gets left behind when the loop is bypassed
 
@@ -179,13 +206,15 @@ lines.
 
 ## Why this is subtle
 
-1. **Today's catch is a wildcard, and the wildcard is the whole point.** `protect_test`
-   exists precisely so that *any* misbehaving test — including one that overflows the
-   stack — is turned into a recorded failure rather than killing the suite. That design
-   relies on the current behaviour where `Stack_overflow` is an ordinary exception
-   catchable by `with e ->`. The new rules remove exactly that property for
-   `Stack_overflow`, so the wildcard silently stops covering the one runtime exception a
-   test framework most needs it to cover.
+1. **In the runners where the catch covers `Stack_overflow`, that coverage is the whole
+   point.** `protect_test` exists precisely so that *any* misbehaving test — including one
+   that overflows the stack — is turned into a recorded failure rather than killing the
+   suite. In the default synchronous runner (and `alcotest-async`) that catch does cover
+   `Stack_overflow` today, relying on it being an ordinary exception catchable by
+   `with e ->`. The new rules remove exactly that property for `Stack_overflow`, so the
+   catch silently stops covering the one runtime exception a test framework most needs it
+   to cover. (In `alcotest-lwt` the catch never covered `Stack_overflow`, so there is
+   nothing to lose there.)
 
 2. **The framework recovers per test, so the "process is dying anyway" reasoning does
    not fully apply.** A one-shot command-line tool can often shrug off an uncaught

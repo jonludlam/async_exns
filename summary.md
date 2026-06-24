@@ -249,10 +249,15 @@ Detailed write-up: `findings/alcotest.md`.
 Alcotest installs no signal handlers, no timers, and no finalisers, and has no Ctrl+C
 handling — so there is nothing to change on the throwing side. The only asynchronous exception
 it can meet is running out of stack. Alcotest is a per-test recovery loop: each test runs
-inside a catch-all that today turns any failure, including a stack overflow in deeply
-recursive test code, into one recorded "failed test" and continues. Under the new rules that
-catch-all no longer catches a stack overflow, so a single such test aborts the whole run and
-the remaining tests silently never run.
+inside a catch that records any failure as one "failed test" and lets the loop continue. But
+that catch is supplied by whichever concurrency library the engine is plugged into, and the
+libraries differ on whether they catch a stack overflow — so whether the change bites depends
+on the runner. The plain (synchronous) runner and the Async runner catch a stack overflow
+today, so under the new rules they stop catching it and a single stack-overflowing test aborts
+the whole run, with the remaining tests silently never running — a real change. The Lwt runner
+is different: Lwt's catch already declines to catch a stack overflow by default, so an
+`alcotest-lwt` run already aborts on such a test today and the new rules change nothing there.
+(The recovery is a property of the plugged-in library, not of the shared engine.)
 
 There is no data corruption (the process is terminating), but one visible clean-up is worth
 fixing: for each test Alcotest redirects the operating-system stdout/stderr to a per-test log

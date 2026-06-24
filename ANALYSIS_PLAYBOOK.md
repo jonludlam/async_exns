@@ -209,6 +209,18 @@ package; their *absence* is where the bugs are. They are also the fixes to recom
    - **Library exposure:** if a suspect function is in an `.mli` and the `dune` has a
      `public_name`, external callers exist — note it, but in-tree callers usually
      settle severity.
+   - **Catch site inside a functor over a concurrency monad? Check every instantiation —
+     the verdict can differ per backend.** When the catch is `M.catch`/`M.bind` for an
+     abstract monad `M`, the engine itself decides nothing; the *instantiating* module's
+     exception semantics do, and they are not uniform: an **Identity** monad's
+     `match f () with … | exception e -> …` catches everything (incl. `Stack_overflow`);
+     **Lwt**'s `catch`/`try_bind`/`finalize` guard with `when Exception_filter.run exn`
+     and the **default filter excludes `Stack_overflow`/`Out_of_memory`** (so Lwt already
+     doesn't catch them — no change); **Async**'s `Monitor.try_with` catches all (incl.
+     `Stack_overflow`). So "the recovery loop catches `Stack_overflow`" may be true for
+     the sync/Async build and false for the Lwt build of the *same* code. Find the
+     `Make (…) (…)` instantiations (grep `Make (`, the `.mli`'s `type return`) and read
+     each monad's `catch`. *(alcotest: same engine, three backends, different verdicts.)*
 
 7. **Determine boundary placement (the real design call).** `Sys.with_async_exns`
    converts async→normal *at the boundary*, bypassing every handler nested below it.
