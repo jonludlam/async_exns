@@ -2,7 +2,7 @@
 
 A plain-language summary of what we found when checking large OCaml programs for
 problems caused by OxCaml's change to "asynchronous exceptions". Each program also has
-a detailed, code-linked write-up in `findings_<name>.md`.
+a detailed, code-linked write-up in `findings/<name>.md`.
 
 ## The problem in plain terms
 
@@ -37,7 +37,7 @@ today — but often only by luck, so they are still worth tidying.
 
 ## Alt-Ergo (an automated theorem prover) — one real bug; tricky to place the wrapper
 
-Detailed write-up: `findings_alt-ergo.md`.
+Detailed write-up: `findings/alt-ergo.md`.
 
 Alt-Ergo enforces a time limit with a CPU timer. When time runs out, the timer's handler
 throws a `Timeout` exception — exactly the kind of exception that changes behaviour. This
@@ -73,7 +73,7 @@ change lands.
 
 ## Dune (the OCaml build system) — almost entirely safe, with one caveat
 
-Detailed write-up: `findings_dune.md`.
+Detailed write-up: `findings/dune.md`.
 
 Dune is already built the way the new model wants. It deliberately blocks Ctrl+C and the
 other signals and deals with them on a dedicated thread, turning them into ordinary
@@ -99,7 +99,7 @@ almost the whole problem, and is worth recommending to other programs.
 
 ## opam (the OCaml package manager) — real, visible bugs
 
-Detailed write-up: `findings_opam.md`.
+Detailed write-up: `findings/opam.md`.
 
 opam is the opposite of dune: on start-up it deliberately asks OCaml to turn Ctrl+C into
 an exception. So Ctrl+C is the event that changes behaviour here. (Out-of-stack and
@@ -129,7 +129,7 @@ opam already has (fixing those few helpers covers everything at once).
 
 ## Lwt (a cooperative-concurrency library) — almost entirely safe
 
-Detailed write-up: `findings_lwt.md`.
+Detailed write-up: `findings/lwt.md`.
 
 Lwt is the library a large part of the OCaml world builds its asynchronous code on. It is
 already arranged the way the new rules want. Its signal handling happens at the C level: a
@@ -153,7 +153,7 @@ noticed a stale comment in Lwt's interface file that should be corrected.)
 
 ## utop (the OCaml REPL) — a real bug: Ctrl+C during evaluation kills the session
 
-Detailed write-up: `findings_utop.md`.
+Detailed write-up: `findings/utop.md`.
 
 utop deliberately turns Ctrl+C into an exception (it calls `Sys.catch_break true`) so that
 an interruption while a user expression is running can be caught. Today the catch-all
@@ -177,7 +177,7 @@ interruption-safe helper once recovery is restored. Everything else checked is c
 
 ## Why3 (the verification platform) — barely affected; no fixes required
 
-Detailed write-up: `findings_why3.md`.
+Detailed write-up: `findings/why3.md`.
 
 Why3 is the least affected of the programs looked at, for an architectural reason: it does
 not enforce prover time limits with an OCaml signal or timer. It runs provers through a
@@ -198,7 +198,7 @@ confirmations.
 
 ## Eio (the effects-based concurrency library) — clear; fragile clean-up and one design call
 
-Detailed write-up: `findings_eio.md`.
+Detailed write-up: `findings/eio.md`.
 
 Eio already does what the new model wants for signals: the only signal handler it installs
 (for child-process exit) does nothing but a signal-safe wake-up, and there is no Ctrl+C
@@ -221,7 +221,7 @@ program directly; a few effects-interaction details need confirming on the OxCam
 
 ## Merlin and ocaml-lsp-server (editor tooling) — one real long-lived-mode bug, plus lost crash-recovery
 
-Detailed write-up: `findings_merlin-ocaml-lsp.md`.
+Detailed write-up: `findings/merlin-ocaml-lsp.md`.
 
 These are the OCaml editor back-ends (ocaml-lsp wraps merlin), both long-lived processes that
 answer many requests and recover from a failed one. Neither turns Ctrl+C into an exception
@@ -244,7 +244,7 @@ interruption-safe. Cooperative request cancellation is unaffected; everything el
 
 ## Alcotest (the test framework) — minor: one visible clean-up gap and a per-test recovery choice
 
-Detailed write-up: `findings_alcotest.md`.
+Detailed write-up: `findings/alcotest.md`.
 
 Alcotest installs no signal handlers, no timers, and no finalisers, and has no Ctrl+C
 handling — so there is nothing to change on the throwing side. The only asynchronous exception
@@ -267,7 +267,7 @@ preserve this). Everything else is clear.
 
 ## Unison (the file synchronizer) — largely safe; file consistency does not rely on catching the interruption
 
-Detailed write-up: `findings_unison.md`.
+Detailed write-up: `findings/unison.md`.
 
 Unison handles Ctrl+C in two stages and only the second is an asynchronous exception: the
 first one or two presses set a flag that the engine notices cooperatively (an ordinary
@@ -291,7 +291,7 @@ cancellation; both are fine.
 
 ## Irmin (the Git-like store) — safe today; one real change in the network server
 
-Detailed write-up: `findings_irmin.md`.
+Detailed write-up: `findings/irmin.md`.
 
 Irmin produces no asynchronous exception of its own: no Ctrl+C handler, no raising signal
 handler, no finaliser, no timer. The only asynchronous exception that can reach its code is
@@ -314,7 +314,7 @@ is the open design call). Everything else is clear or low-severity.
 
 ## Rocq (the theorem prover, formerly Coq) — no genuine bug; the famous example is already guarded
 
-Detailed write-up: `findings_rocq.md`.
+Detailed write-up: `findings/rocq.md`.
 
 Rocq is the original motivating example: the design note recalls that pressing Ctrl+C at the
 wrong moment in a Coq proof "would cause it to succeed, even if false." That specific bug is
@@ -349,7 +349,7 @@ interrupted (no write-to-temp-then-rename) — and should move to the existing s
 
 ## Frama-C (the C analysis platform) — minor and mode-dependent: no batch bug, two real server-mode bugs
 
-Detailed write-up: `findings_frama-c.md`.
+Detailed write-up: `findings/frama-c.md`.
 
 Frama-C analyses C code either as a one-shot batch command or as a long-lived `-server` process.
 Only one asynchronous exception matters: Ctrl+C (`Sys.Break`). Frama-C asks the standard library

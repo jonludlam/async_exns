@@ -287,9 +287,9 @@ that all use `new_protect` → the catch-to-decide site(s) needing a `Sys.with_a
 wrapper and that its placement is the open design call → "everything else checked is
 clear".* Embed GitHub links on the named sites.
 
-### 2. Detailed per-package doc `findings_<pkg>.md`
+### 2. Detailed per-package doc `findings/<pkg>.md`
 
-Mirror `findings_alt-ergo.md`. Sections:
+Mirror `findings/alt-ergo.md`. Sections:
 - **Header**: repo + pinned SHA + clone path.
 - **Bottom line**: bulleted blast radius, raise-side need, genuine bug(s), fragile
   sites, result-conversion sites, "everything else clear".
@@ -310,14 +310,14 @@ Mirror `findings_alt-ergo.md`. Sections:
   convert fragile sites for robustness, (5) OxCaml runtime confirmations. Note
   coupling (1+2 land together) and the "don't use a converting bracket" warning.
 
-### 3. Append a plain-English entry to the shared `findings_summary.md` (REQUIRED — don't skip)
+### 3. Append a plain-English entry to the shared `summary.md` (REQUIRED — don't skip)
 
-A package is **not done** until its entry is added to `findings_summary.md`. This is the
+A package is **not done** until its entry is added to `summary.md`. This is the
 easy step to forget, so treat it as part of "finishing" every package.
 - Add a new `## <Package> (<one-line what-it-is>) — <verdict>` section, in the same
   plain-English style as the existing entries (a few short paragraphs, not the terse
   one-paragraph summary, and not the detailed report).
-- Link to the detailed `findings_<pkg>.md`.
+- Link to the detailed `findings/<pkg>.md`.
 - Insert it *before* the "Still to do" section, and remove the package from "Still to do"
   / the worklist line.
 - This shared file is the **one place cross-package comparison is allowed** — but keep
