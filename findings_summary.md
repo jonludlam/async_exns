@@ -12,7 +12,7 @@ surface as ordinary exceptions, so a normal `try … with` block catches them �
 programmers rely on that to do clean-up work: release a lock, delete a temporary file,
 undo a half-finished change, put a setting back, and so on.
 
-OxCaml changes this. These "interrupting" exceptions now travel a *separate* route. An
+OxCaml changes this. These "asynchronous" exceptions now travel a *separate* route. An
 ordinary `try … with` no longer catches them. Unless the program wraps the right region
 in a new special handler, the exception flies straight past all the normal handlers and
 either reaches that wrapper or stops the program outright.
@@ -57,7 +57,7 @@ flag, not the correctness of the prover's answers.)
 A few other spots look dangerous but are safe today by luck: one resets its working state
 at the *start* of its next use anyway; another relies on the timer being one-shot (the
 only way to skip its clean-up is the timer firing, which has already used it up). Not bugs
-now, but fragile — they would break if a second kind of interrupting exception were ever
+now, but fragile — they would break if a second kind of asynchronous exception were ever
 allowed here — so they should still be moved to the safe pattern.
 
 **Why the wrapper placement is the hard part.** It is tempting to put one wrapper high up
@@ -80,7 +80,7 @@ other signals and deals with them on a dedicated thread, turning them into ordin
 internal messages. Because of that they are never thrown as exceptions at all, so the
 change doesn't affect them — and there is nothing to fix on the throwing side.
 
-The only interrupting exception left is "out of stack space". For a normal one-off
+The only asynchronous exception left is "out of stack space". For a normal one-off
 `dune build` this is not a problem: nothing tries to recover from it, so the program just
 stops, exactly as today.
 
@@ -137,7 +137,7 @@ signal merely writes a byte into an internal pipe, and the OCaml code that respo
 runs later as ordinary work — so signals never arrive as exceptions, and there is nothing
 to fix for Ctrl+C.
 
-The only interrupting exception that can reach Lwt is running out of stack space. And here
+The only asynchronous exception that can reach Lwt is running out of stack space. And here
 an existing design choice helps: the place where Lwt runs your callbacks already declines,
 by default, to catch "out of stack" (and "out of memory"). So those events already skip all
 of Lwt's catch-and-clean-up machinery today — which means the new rules change nothing for
@@ -187,7 +187,7 @@ a timeout arrives as an ordinary return value, not an exception — every "timeo
 whole-repository search finds no Ctrl+C handling, no OCaml timers, and no garbage-collector
 finalisers, so there is nothing to change on the throwing side.
 
-The only interrupting exception Why3 can produce is running out of stack, and it is caught
+The only asynchronous exception Why3 can produce is running out of stack, and it is caught
 nowhere — so it is fatal today and stays fatal, and no recovery path changes. A few clean-up
 spots (flushing and closing output files, removing a temp file) would be skipped, but the
 process is terminating and the external prover process is reaped by an exit handler, so none
@@ -204,7 +204,7 @@ Eio already does what the new model wants for signals: the only signal handler i
 (for child-process exit) does nothing but a signal-safe wake-up, and there is no Ctrl+C
 handling, no timer, and no finaliser — so nothing needs changing on the throwing side. Its
 own cancellation is an ordinary cooperative exception and is unaffected. The only
-interrupting exception that can reach it is running out of stack, which it catches nowhere,
+asynchronous exception that can reach it is running out of stack, which it catches nowhere,
 so it stays fatal as today with no lost recovery.
 
 What does change: an interruption skips Eio's resource-teardown brackets, which nearly all
@@ -226,7 +226,7 @@ Detailed write-up: `findings_merlin-ocaml-lsp.md`.
 These are the OCaml editor back-ends (ocaml-lsp wraps merlin), both long-lived processes that
 answer many requests and recover from a failed one. Neither turns Ctrl+C into an exception
 (merlin ignores signals; ocaml-lsp handles them on a dedicated thread as events), so there is
-nothing to change on the throwing side. The only interrupting exception that can reach them is
+nothing to change on the throwing side. The only asynchronous exception that can reach them is
 running out of stack.
 
 There is one genuine bug, in merlin's normal `server` mode: each query swaps the compiler's
@@ -247,7 +247,7 @@ interruption-safe. Cooperative request cancellation is unaffected; everything el
 Detailed write-up: `findings_alcotest.md`.
 
 Alcotest installs no signal handlers, no timers, and no finalisers, and has no Ctrl+C
-handling — so there is nothing to change on the throwing side. The only interrupting exception
+handling — so there is nothing to change on the throwing side. The only asynchronous exception
 it can meet is running out of stack. Alcotest is a per-test recovery loop: each test runs
 inside a catch-all that today turns any failure, including a stack overflow in deeply
 recursive test code, into one recorded "failed test" and continues. Under the new rules that
@@ -269,7 +269,7 @@ preserve this). Everything else is clear.
 
 Detailed write-up: `findings_unison.md`.
 
-Unison handles Ctrl+C in two stages and only the second is an interrupting exception: the
+Unison handles Ctrl+C in two stages and only the second is an asynchronous exception: the
 first one or two presses set a flag that the engine notices cooperatively (an ordinary
 exception on the normal path), and only the third press raises the interruption to force
 termination. The throwing side needs no change. Its main clean-up helpers only ever catch
@@ -293,8 +293,8 @@ cancellation; both are fine.
 
 Detailed write-up: `findings_irmin.md`.
 
-Irmin produces no interrupting exception of its own: no Ctrl+C handler, no raising signal
-handler, no finaliser, no timer. The only interrupting exception that can reach its code is
+Irmin produces no asynchronous exception of its own: no Ctrl+C handler, no raising signal
+handler, no finaliser, no timer. The only asynchronous exception that can reach its code is
 running out of stack — realistic, because it walks deep object graphs — and its core library
 and on-disk backend catch it nowhere, so it stays fatal with no recovery lost. Any Ctrl+C
 handling is the embedding application's responsibility.
@@ -324,10 +324,10 @@ timeouts, and stack overflow instead of reporting success. Under the new rules t
 would bypass that handler entirely and propagate anyway, so the soundness guarantee is preserved
 either way; the change actually removes the reliance on getting that test exactly right.
 
-Only two interrupting exceptions are in play, and which one you get depends on the mode. The
+Only two asynchronous exceptions are in play, and which one you get depends on the mode. The
 time-limit machinery (the `Timeout` tactic, `-time`) raises a timeout from inside a SIGALRM
 handler and catches it immediately in the same small function. Ctrl+C arrives as `Sys.Break`:
-interrupting when it comes from OCaml's standard Ctrl+C catching (used by `rocq compile`/`coqc`
+asynchronous when it comes from OCaml's standard Ctrl+C catching (used by `rocq compile`/`coqc`
 and the prompt) or from the editor back-end's own handler while evaluating a request, but
 cooperative — and so unaffected — when it comes from the pervasive interrupt check-point the
 kernel and tactics use. Running out of stack can happen in the deeply recursive kernel but is
@@ -352,9 +352,9 @@ interrupted (no write-to-temp-then-rename) — and should move to the existing s
 Detailed write-up: `findings_frama-c.md`.
 
 Frama-C analyses C code either as a one-shot batch command or as a long-lived `-server` process.
-Only one interrupting exception matters: Ctrl+C (`Sys.Break`). Frama-C asks the standard library
+Only one asynchronous exception matters: Ctrl+C (`Sys.Break`). Frama-C asks the standard library
 to turn Ctrl+C into `Sys.Break` at start-up and again in the server, and the Eva plug-in installs
-its own handler that also raises `Sys.Break` — all of which OxCaml makes interrupting for free, so
+its own handler that also raises `Sys.Break` — all of which OxCaml makes asynchronous for free, so
 the throwing side needs essentially no change (one cheap runtime confirmation for the hand-written
 handler). Its general cancellation and the prover timeout are not signal-driven at all — they set
 a flag and raise at explicit check-points — so they keep working unchanged. There are no
@@ -366,7 +366,7 @@ only losses are cosmetic (Eva's "save partial results on Ctrl+C" feature, the cl
 are restored by placing the wrapper correctly. The genuine bugs appear in the long-lived server
 mode, which recovers from an interrupt and keeps serving: two kernel-wide restore helpers — one
 that restores which "project" is current, one that resets a "has this run?" flag — restore
-long-lived global state through a clean-up handler that an interrupting Ctrl+C skips. Skipping them
+long-lived global state through a clean-up handler that an asynchronous Ctrl+C skips. Skipping them
 leaves the wrong project current for every later request, and makes the Eva analysis believe it has
 already run, so it silently returns nothing.
 
@@ -388,7 +388,7 @@ package (`frama-c-gui`) not in the analysed repository.
 
 ## Patterns we keep seeing
 
-- **Start by asking which interrupting exceptions a program can actually produce.** It is
+- **Start by asking which asynchronous exceptions a program can actually produce.** It is
   usually just one or two, and everything else follows. (Alt-Ergo: a timeout. Dune: only
   "out of stack". opam: Ctrl+C.)
 - **A skipped clean-up is only a real bug if something later notices.** State that is

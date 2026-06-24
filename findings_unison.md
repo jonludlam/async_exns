@@ -10,29 +10,29 @@ OxCaml's new rules for "asynchronous exceptions".
 A few kinds of event can interrupt an OCaml program at almost any moment: pressing Ctrl+C,
 a time-limit going off, or the program running out of stack space. Today they surface as
 ordinary exceptions, so a normal `try … with` catches them. OxCaml changes this: these
-interrupting exceptions now travel a separate route, an ordinary `try … with` no longer
+asynchronous exceptions now travel a separate route, an ordinary `try … with` no longer
 catches them, and unless the program wraps the right region in a new special handler
-(`Sys.with_async_exns`, which turns an interrupting exception back into an ordinary one
+(`Sys.with_async_exns`, which turns an asynchronous exception back into an ordinary one
 at that point) the exception flies straight past every normal handler and either reaches
-that wrapper or stops the program. Below we call them "interrupting exceptions".
+that wrapper or stops the program.
 
 ## Bottom line
 
 - **Unison turns Ctrl+C into `Sys.Break`, but in two stages, and only the second stage is
-  interrupting.** In the text interface, the first one or two Ctrl+C presses run a signal
+  asynchronous.** In the text interface, the first one or two Ctrl+C presses run a signal
   handler that merely sets a flag (`Abort.all ()`) — a *cooperative* request that the
   transport engine notices at its own checkpoints and turns into an ordinary `Util.Transient`
   exception. Only the **third (and later) Ctrl+C** actually `raise Sys.Break` *from inside
   the signal handler*
   ([`uitext.ml:919-925`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L936)),
-  to force immediate termination. That forced `Sys.Break` is the genuine interrupting
+  to force immediate termination. That forced `Sys.Break` is the genuine asynchronous
   exception. (`Sys.Break` is *also* raised the ordinary way from non-handler code — see
   below — and those raises are unaffected.)
 - **Throwing side: nothing to do for Ctrl+C.** Unison installs its own `SIGINT` handler
   that ends in `raise Sys.Break`
   ([`uitext.ml:946`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L937-L959)),
   and it also calls `Sys.catch_break true`. OxCaml already arranges for a `Sys.Break`
-  escaping a signal handler to become an interrupting exception, so no code change is
+  escaping a signal handler to become an asynchronous exception, so no code change is
   needed to throw it the new way.
 - **Only `Sys.Break` is actually affected; the residual is `Stack_overflow`.** "Out of
   stack" (`Stack_overflow`) can always happen in a deeply recursive program like Unison,
@@ -59,7 +59,7 @@ that wrapper or stops the program. Below we call them "interrupting exceptions".
 
   A `Sys.Break` (or `Stack_overflow`, or `Util.Fatal` for the first two) already skips all
   of these *today*. So the on-disk-consistency clean-up that matters does **not** rely on
-  catching the interrupting exception, and the new model does not change its behaviour.
+  catching the asynchronous exception, and the new model does not change its behaviour.
   This is why Unison is largely a non-target.
 - **The only clean-up combinator that does catch `Sys.Break` today is `Copy.protect`**
   ([`copy.ml:24-35`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/copy.ml#L24-L36))
@@ -81,7 +81,7 @@ that wrapper or stops the program. Below we call them "interrupting exceptions".
   `DANGER.README` and **refuses to proceed** until the user checks the files
   ([`processCommitLog`, files.ml:70-79](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/files.ml#L70-L79)).
   This protection is a *file on disk*, not an exception handler, so it survives an
-  interrupting `Sys.Break` (indeed it survives `kill -9`). The archive itself is committed
+  asynchronous `Sys.Break` (indeed it survives `kill -9`). The archive itself is committed
   by a careful multi-phase write-scratch-then-flip
   ([`commitUpdates`, update.ml:2626-2660](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/update.ml#L2626-L2660)),
   and only *after* all transfers finish, so an interruption either leaves the old archive
@@ -116,7 +116,7 @@ that wrapper or stops the program. Below we call them "interrupting exceptions".
 
 ## Which exceptions are affected
 
-### `Sys.Break` — interrupting only when forced from the signal handler
+### `Sys.Break` — asynchronous only when forced from the signal handler
 
 Unison's text UI installs its own `SIGINT` handler `ctrlCHandler`
 ([`uitext.ml:924-936`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L959), via
@@ -131,13 +131,13 @@ Unison's text UI installs its own `SIGINT` handler `ctrlCHandler`
    cancellation along the normal path, unaffected by the change.
 2. **Third+ Ctrl+C** → `raise Sys.Break`
    ([`uitext.ml:920`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L922))
-   *from inside the handler*. This is the genuine interrupting exception: today it surfaces
+   *from inside the handler*. This is the genuine asynchronous exception: today it surfaces
    at the next safe point and one of the `with Sys.Break` / catch-all handlers above catches
    it; under the new model none of them do, and it goes to the nearest `Sys.with_async_exns`
    or stops the program.
 
 So the *graceful* Ctrl+C path (presses 1–2) is cooperative and unaffected; the *forced*
-Ctrl+C path (press 3+) is the one interrupting exception that changes behaviour.
+Ctrl+C path (press 3+) is the one asynchronous exception that changes behaviour.
 
 `Sys.Break` is *also* raised the **ordinary** way from non-handler code — the interactive
 "quit" menu entries
@@ -226,13 +226,13 @@ Unison has three relevant run shapes:
    [`remote.ml:2300-2330`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/remote.ml#L2300-L2330)).
    This is genuinely long-lived and *does* catch `Sys.Break` to clean up:
    `with Sys.Break -> unixSocketCleanup ()` removes the listening Unix-domain socket file.
-   Under the new model that handler stops firing, so an interrupting `Sys.Break` leaves the
+   Under the new model that handler stops firing, so an asynchronous `Sys.Break` leaves the
    **socket file on disk**, which can block the next server start. This is the one
    long-lived-mode site where a skipped clean-up has an observable on-disk effect.
 
 ## Clean-up that could be skipped
 
-Verdicts assume the genuine interrupting exception is a forced `Sys.Break` (3rd+ Ctrl+C) or
+Verdicts assume the genuine asynchronous exception is a forced `Sys.Break` (3rd+ Ctrl+C) or
 `Stack_overflow`.
 
 | Site | Cleanup | Verdict | Why |
@@ -251,9 +251,9 @@ Verdicts assume the genuine interrupting exception is a forced `Sys.Break` (3rd+
    fires at some arbitrary safe point, so whichever matching `with Sys.Break` / catch-all
    handler happens to be innermost at that instant catches it. The handlers are written
    defensively precisely because Ctrl+C can land anywhere.
-2. **Graceful vs forced Ctrl+C is the key split, and only the forced path is interrupting.**
+2. **Graceful vs forced Ctrl+C is the key split, and only the forced path is asynchronous.**
    The first two presses are cooperative (`Abort.all ()` → checkpoint → `Util.Transient`,
-   the normal path), and remain so. Only the third+ press raises an interrupting `Sys.Break`
+   the normal path), and remain so. Only the third+ press raises an asynchronous `Sys.Break`
    from the handler.
 3. **The handlers form a clean-up-then-decide chain.** A forced Ctrl+C deep in a transfer
    runs, innermost-out:
@@ -292,11 +292,11 @@ that catches everything.
 | Catches `Sys.Break` to decide what to do next | text UI top level ([`uitext.ml:1734`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L1733-L1734)); socket server ([`remote.ml:2325`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/remote.ml#L2320-L2329)); and, if their messages are worth keeping, the summary ([`uitext.ml:1088`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L1083-L1098)) and `stopAtIntr` ([`uitext.ml:955`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L954-L958)) | wrap the relevant region in `Sys.with_async_exns` so the forced `Sys.Break` becomes an ordinary one and the existing handler fires | design call (where to put each wrapper) |
 
 `new_protect`'s shape: `new_protect : init:(unit -> 'a) -> body:('a -> 'b) ->
-finaliser:('a -> unit) -> 'b`, which runs the finaliser even when an interrupting exception
+finaliser:('a -> unit) -> 'b`, which runs the finaliser even when an asynchronous exception
 unwinds, then re-raises it.
 
 **Caveat — how the bracket re-raises.** A `new_protect` for `Copy.protect` should re-raise
-the *interrupting* exception unchanged (free the fd / drop the temp, keep the Break flying);
+the *asynchronous* exception unchanged (free the fd / drop the temp, keep the Break flying);
 you then add an explicit `Sys.with_async_exns` at the top level to get the clean
 `terminate ()`. A version that turned the interruption back into an *ordinary* exception
 would re-enable Unison's downstream `with Sys.Break` / catch-all arms swallowing a future
@@ -305,13 +305,13 @@ Ctrl+C — against the model. Best: interruption-safe `Copy.protect` + one expli
 
 ## Resolved during this pass
 
-- **Forced Ctrl+C is the only interrupting `Sys.Break`; graceful Ctrl+C is cooperative.**
+- **Forced Ctrl+C is the only asynchronous `Sys.Break`; graceful Ctrl+C is cooperative.**
   Confirmed by reading `ctrlCHandler`/`sigtermHandler`
   ([`uitext.ml:919-936`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L936)):
   presses 1–2 call `Abort.all ()` (flag → checkpoint → `Util.Transient`, normal path); only
   press 3+ raises `Sys.Break` from the handler. The single most important fact for Unison.
 - **Throwing side needs no change** — OxCaml already makes a `Sys.Break` escaping a signal
-  handler interrupting, and Unison both uses `Sys.catch_break true` and its own handler that
+  handler asynchronous, and Unison both uses `Sys.catch_break true` and its own handler that
   raises `Sys.Break`.
 - **The clean-up combinators ignore `Sys.Break` by design** — `Util.unwindProtect`/
   `Util.finalize` catch only `Util.Transient`
@@ -328,7 +328,7 @@ Ctrl+C — against the model. Best: interruption-safe `Copy.protect` + one expli
 - **`at_exit` runs on uncaught `Sys.Break`** — verified by experiment on stock OCaml 5.x
   (the `at_exit` callback fired; exit code 2). So `releaseHeldLocks`
   ([`update.ml:950`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/update.ml#L946-L950))
-  releases archive locks even on an uncaught forced Ctrl+C *if OxCaml's interrupting-uncaught
+  releases archive locks even on an uncaught forced Ctrl+C *if OxCaml's asynchronous-uncaught
   path also runs `at_exit`* (one thing to confirm on the runtime).
 - **No timers, no GC finalisers in the core, no memprof** — no `setitimer`/`Unix.alarm`;
   the only `Gc.finalise` is in the Solaris fsmonitor helper, not the synced core; the other
@@ -348,11 +348,11 @@ Ctrl+C — against the model. Best: interruption-safe `Copy.protect` + one expli
   so `unixSocketCleanup ()` removes the socket file. Optionally lower wrappers if the
   "interrupted" summary line and signal-handler restore are wanted.
 - **OxCaml confirmation** (needs the runtime, not the source): does `at_exit` run on
-  interrupting-uncaught termination (so `releaseHeldLocks` and the log flush survive)?
+  asynchronous-uncaught termination (so `releaseHeldLocks` and the log flush survive)?
 
 ## Checked and fine
 
-- **`Stack_overflow`** — listed as interrupting by the doc; Unison is deeply recursive
+- **`Stack_overflow`** — listed as asynchronous by the doc; Unison is deeply recursive
   (archive trees, reconciliation), but has **no** catch sites. Uncaught/fatal today, stays
   fatal. On its way out it skips the same `Copy.protect`/handler frames as a forced Break —
   same "safe today only by luck" analysis, minus any recovery path; on-disk state is still
@@ -383,7 +383,7 @@ Ctrl+C — against the model. Best: interruption-safe `Copy.protect` + one expli
   — these are synchronous raises from ordinary code, caught normally; **unaffected** by the
   change. (They do share the top-level catch sites, which is why the wrapper there still
   needs to admit ordinary `Sys.Break` too — `Sys.with_async_exns` does, it only *adds* the
-  interrupting ones.)
+  asynchronous ones.)
 - **`fsmonitor` Solaris `Gc.finalise`** ([`watcher.ml:85`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/fsmonitor/solaris/watcher.ml#L85))
   — in the optional file-watcher helper, frees a C event object; not in the synced core, and
   a `free` finaliser does not raise.
@@ -391,7 +391,7 @@ Ctrl+C — against the model. Best: interruption-safe `Copy.protect` + one expli
 ## Recommendations
 
 In priority order. The throwing side already works (`Sys.catch_break` / the custom handler's
-`raise Sys.Break` already become interrupting on OxCaml), and on-disk consistency does not
+`raise Sys.Break` already become asynchronous on OxCaml), and on-disk consistency does not
 depend on catching the interruption, so the work is small.
 
 1. **Add a `Sys.with_async_exns` wrapper at each top level (the one design call).**
@@ -407,9 +407,9 @@ depend on catching the interruption, so the work is small.
 2. **Make `Copy.protect`/`lwt_protect` interruption-safe**
    ([`copy.ml:24-35`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/copy.ml#L24-L36))
    — rebuild as a `new_protect`-style bracket that closes the fd / drops the partial temp
-   even on an interrupting exception, re-raising it unchanged. Low stakes (the fds are
+   even on an asynchronous exception, re-raising it unchanged. Low stakes (the fds are
    independently cleaned at connection close and the temp is harmless), but good hygiene and
-   the one bracket whose "luck" runs out if a second interrupting exception enters scope.
+   the one bracket whose "luck" runs out if a second asynchronous exception enters scope.
 
 3. **Nothing needed for the clean-up combinators or on-disk consistency** —
    `Util.unwindProtect`/`Util.finalize`/`Remote.Thread.unwindProtect` already only run on
@@ -417,7 +417,7 @@ depend on catching the interruption, so the work is small.
    lock release carry crash-safety independently of exceptions.
 
 4. **Confirm on the OxCaml runtime** (not derivable from source): does `at_exit` run on
-   interrupting-uncaught termination (so `releaseHeldLocks` and the log flush survive)?
+   asynchronous-uncaught termination (so `releaseHeldLocks` and the log flush survive)?
 
 **Sequencing note:** (1) restores today's graceful-interrupt behaviour and is the substantive
 change; (2) is independent hygiene; (3) is a no-op (already correct); (4) gates how much (1)

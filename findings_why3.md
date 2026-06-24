@@ -7,12 +7,12 @@ to that commit.
 What this pass covers: a search for code that works correctly today but would break
 under OxCaml's new rules for "asynchronous exceptions".
 
-Background in one sentence: an *asynchronous exception* is an interrupting event —
+Background in one sentence: an *asynchronous exception* is an event —
 pressing Ctrl+C, running out of stack, or an exception thrown from a signal handler or
 a garbage-collector callback — that can surface at almost any point in the program.
 Today an ordinary `try … with` catches these; under the new rules it does not, unless
-you wrap the region in a new helper (`Sys.with_async_exns`) that turns the interrupting
-exception back into an ordinary one. We call these "interrupting exceptions" below.
+you wrap the region in a new helper (`Sys.with_async_exns`) that turns the asynchronous
+exception back into an ordinary one. We call these "asynchronous exceptions" below.
 
 ## Bottom line
 
@@ -20,7 +20,7 @@ exception back into an ordinary one. We call these "interrupting exceptions" bel
   OCaml exception (no `Sys.Break`, no `Sys.catch_break` anywhere), it arms no OCaml
   timer (`Unix.setitimer`/`Unix.alarm` appear nowhere in the OCaml code), it registers
   no garbage-collector finalisers (`Gc.finalise`), and it catches `Stack_overflow`
-  nowhere. The one residual interrupting exception is **`Stack_overflow`**, which is
+  nowhere. The one residual asynchronous exception is **`Stack_overflow`**, which is
   never caught and is therefore fatal today and stays fatal.
 - **Time limits are enforced outside OCaml.** Prover time/memory limits are imposed by
   a separate helper process, `why3server`, written in C
@@ -38,12 +38,12 @@ exception back into an ordinary one. We call these "interrupting exceptions" bel
   application exception (see "Which exceptions are affected"), so there is nothing to
   re-route through `Sys.raise_async`.
 - **No genuine bugs found, and nothing that is "safe today only by luck" in a worrying
-  way.** Because the only interrupting exception is an uncaught `Stack_overflow`, the
+  way.** Because the only asynchronous exception is an uncaught `Stack_overflow`, the
   clean-up that it skips on its way out is limited (three `Fun.protect` sites and a
   couple of hand-rolled temp-file removals), and the externally-visible parts are
   backstopped by an `at_exit` handler that disconnects from and reaps `why3server`.
 - **No code needs a `Sys.with_async_exns` wrapper for correctness**, because no
-  interrupting exception is caught anywhere today. The top-level catch-all handlers in
+  asynchronous exception is caught anywhere today. The top-level catch-all handlers in
   the command-line tools and the per-request/per-connection handlers in the web server
   catch *ordinary* exceptions; an uncaught `Stack_overflow` slipping past them changes
   nothing meaningful (it was going to terminate that unit of work either way).
@@ -53,7 +53,7 @@ exception back into an ordinary one. We call these "interrupting exceptions" bel
 
 ## Which exceptions are affected
 
-The decisive question — *which interrupting exceptions can this program actually
+The decisive question — *which asynchronous exceptions can this program actually
 produce?* — has an unusually short answer for Why3: only **`Stack_overflow`**.
 
 ### No Ctrl+C exception, no OCaml timer
@@ -111,10 +111,10 @@ The scheduler that drives all of this is a **cooperative polling loop**, not a
 signal-driven one: it computes a delay and waits in `Unix.select`, running registered
 "timeout" callbacks when their time arrives
 ([`unix_scheduler.ml:52-118`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/session/unix_scheduler.ml#L52-L119)).
-The word "timeout" here means "a function to run after a delay", not an interrupting
+The word "timeout" here means "a function to run after a delay", not an asynchronous
 exception.
 
-### The residual interrupting exception: `Stack_overflow`
+### The residual asynchronous exception: `Stack_overflow`
 
 Why3 manipulates large terms and is deeply recursive, so the runtime can still raise
 `Stack_overflow` asynchronously. But Why3 **catches it nowhere** (a whole-repository
@@ -126,7 +126,7 @@ only thing to assess is the clean-up that a `Stack_overflow` skips on its way ou
 
 ## Clean-up that could be skipped
 
-The only interrupting exception in play is an uncaught, fatal `Stack_overflow`. So the
+The only asynchronous exception in play is an uncaught, fatal `Stack_overflow`. So the
 question for each clean-up site is narrower than usual: not "does a recovery handler
 stop firing" (none exists), but "does a `Stack_overflow` flying out of the process skip
 some clean-up that is *externally* visible (a file, a child process) and not otherwise
@@ -134,13 +134,13 @@ backstopped?" In every case the answer is no.
 
 | Site | Clean-up | Verdict | Why |
 |------|---------|---------|-----|
-| [`sysutil.ml:69-76`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/sysutil.ml#L69-L76) `write_file_fmt` and [`sysutil.ml:79-95`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/sysutil.ml#L79-L95) `write_unique_file_fmt` | `Fun.protect ~finally:(flush + close_out)` | safe today only by luck → mildly fragile | Today the `finally` flushes and closes the output channel on any exception. A `Stack_overflow` skipping it leaves a channel unflushed, but the process is terminating, so the only loss is the buffered tail of one output file — and the process is dying anyway. No leaked resource the next run sees. Becomes a real concern only if a *second*, recoverable interrupting exception is ever introduced through this code. |
+| [`sysutil.ml:69-76`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/sysutil.ml#L69-L76) `write_file_fmt` and [`sysutil.ml:79-95`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/sysutil.ml#L79-L95) `write_unique_file_fmt` | `Fun.protect ~finally:(flush + close_out)` | safe today only by luck → mildly fragile | Today the `finally` flushes and closes the output channel on any exception. A `Stack_overflow` skipping it leaves a channel unflushed, but the process is terminating, so the only loss is the buffered tail of one output file — and the process is dying anyway. No leaked resource the next run sees. Becomes a real concern only if a *second*, recoverable asynchronous exception is ever introduced through this code. |
 | [`debug.ml:162-167`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/debug.ml#L162-L167) `record_timing` | `Fun.protect ~finally:(add_timing …)` | low severity (diagnostic) | Pure profiling: records elapsed time into a table, and only when the `stats` debug flag is on (off by default). No resource, no result, no soundness impact. |
 | [`sysutil.ml:98-109`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/sysutil.ml#L98-L109) `open_temp_file` | hand-rolled `try … with e -> Sys.remove file; close_out cout; raise e` | safe today only by luck → mildly fragile | Removes a temp file and closes its channel on any exception. A `Stack_overflow` skipping it leaves one temp file on disk as the process dies. Wasted disk space at worst; no broken invariant, and not observed by a later run. |
 | [`call_provers.ml:602-616`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/driver/call_provers.ml#L602-L616) VC temp file → [`call_provers.ml:479-494`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/driver/call_provers.ml#L479-L494) deletion in `handle_answer` | temp VC file deleted when the `Finished` value arrives | safe today only by luck | The VC file is *not* deleted in a `finally`; it is deleted when the server's `Finished` result is received and dispatched. A `Stack_overflow` between sending the file and receiving the result leaves that temp file behind as the process dies — same "wasted disk space, process exiting anyway" reasoning. The running prover child is owned and time-limited by `why3server`, which the `at_exit` below reaps. |
 
 There is no place where skipped clean-up corrupts a persistent invariant: the only
-interrupting exception is terminal, so in-memory state does not matter, and the
+asynchronous exception is terminal, so in-memory state does not matter, and the
 externally-visible pieces (the `why3server` connection and its child processes) are
 covered by an `at_exit` handler:
 
@@ -153,8 +153,8 @@ covered by an `at_exit` handler:
 ## Why this is subtle
 
 For most programs the hard part is reasoning about *which* of many handlers catches an
-interrupting exception, and *where* to put the new wrapper. For Why3 the subtlety is the
-opposite: it is easy to *assume* there is interrupting-exception machinery to fix —
+asynchronous exception, and *where* to put the new wrapper. For Why3 the subtlety is the
+opposite: it is easy to *assume* there is asynchronous-exception machinery to fix —
 there is a prover scheduler, "timeout" everywhere, an interrupt feature, an IDE — and
 then to discover that **none of it raises an exception through OCaml frames**:
 
@@ -163,7 +163,7 @@ then to discover that **none of it raises an exception through OCaml frames**:
 - "Interrupt" is a cooperative socket message, never a `Sys.Break`.
 - The scheduler's "timeout" is a poll-loop callback, not a timer signal.
 
-So the analysis collapses early. The only genuinely interrupting exception the program
+So the analysis collapses early. The only genuinely asynchronous exception the program
 can produce is `Stack_overflow`, and because nothing catches it, the new rules cannot
 change any control flow: a `Stack_overflow` was fatal before and is fatal after. The
 only delta is which clean-up runs on the way out — and that delta is the same whether or
@@ -171,17 +171,17 @@ not a wrapper is added, because there is no handler to convert anything *to*.
 
 ## How to fix it
 
-There is no correctness fix required, because there is no interrupting exception that is
+There is no correctness fix required, because there is no asynchronous exception that is
 caught today and would stop being caught. The (optional) hygiene work is small:
 
 | Site kind | Sites | Fix | Difficulty |
 |-----------|-------|-----|------------|
 | Resource / file clean-up that only needs "the finaliser must run" | `sysutil.ml` `write_file_fmt`, `write_unique_file_fmt`, `open_temp_file`; `debug.ml` `record_timing` | the interruption-safe bracket `new_protect` (an interruption-aware version of the clean-up helper that runs the clean-up and then re-throws the interruption unchanged) | mechanical, local, optional |
-| Code that catches the exception to decide what to do next | none for interrupting exceptions | — | — |
+| Code that catches the exception to decide what to do next | none for asynchronous exceptions | — | — |
 
-`Sys.with_async_exns` (the helper that turns an interrupting exception back into an
+`Sys.with_async_exns` (the helper that turns an asynchronous exception back into an
 ordinary one at the point it is placed) is **not needed anywhere** for correctness,
-because no interrupting exception is caught today. If Why3 ever decides it wants
+because no asynchronous exception is caught today. If Why3 ever decides it wants
 `Stack_overflow` (or a future Ctrl+C handler) to be *recoverable* rather than fatal —
 for example, to keep the IDE or the web server alive across a stack overflow in one
 proof task — *then* it would add a `Sys.with_async_exns` boundary around each unit of
@@ -193,10 +193,10 @@ That is a *new feature*, not a fix for a regression, and is out of scope for thi
 
 **Caveat on how a clean-up bracket re-throws.** If the four clean-up sites are ever
 converted, use a bracket that holds off the interruption, runs the clean-up, and
-re-throws the exception *still interrupting* (`new_protect`). Do not use a converting
+re-throws the exception *still asynchronous* (`new_protect`). Do not use a converting
 bracket that re-throws an *ordinary* exception: Why3 has many downstream `with _ ->` /
 `with e ->` catch-alls (the top-level tool handlers, the web-server handlers) that would
-then silently swallow a future interrupting exception — against the point of the new
+then silently swallow a future asynchronous exception — against the point of the new
 model. For the four sites here, which only release a file/channel and re-raise, plain
 resource safety is the same either way.
 
@@ -219,7 +219,7 @@ resource safety is the same either way.
   OCaml: a program dying from an uncaught `Stack_overflow` still ran its `at_exit`
   callback (exit code 2). So the `why3server` disconnect-and-reap
   ([`prove_client.ml:147-149`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/driver/prove_client.ml#L147-L150))
-  survives the only fatal interrupting path here — provided OxCaml's uncaught path also
+  survives the only fatal asynchronous path here — provided OxCaml's uncaught path also
   runs `at_exit` (one runtime confirmation).
 - **The disabled SIGINT handler is genuinely disabled** —
   [`debug.ml:184-190`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/util/debug.ml#L184-L190)
@@ -228,17 +228,17 @@ resource safety is the same either way.
 ## Still open (runtime confirmations, not investigations)
 
 - **OxCaml `at_exit` behaviour.** Confirm on the OxCaml runtime that `at_exit` runs on
-  interrupting-uncaught termination (specifically `Stack_overflow`), so the `why3server`
+  asynchronous-uncaught termination (specifically `Stack_overflow`), so the `why3server`
   disconnect/reap still happens. Verified on stock OCaml; needs one check on OxCaml.
 - **OxCaml `Stack_overflow` stays fatal-and-uncaught.** The whole analysis rests on
-  `Stack_overflow` being uncaught in Why3 (it is) and remaining a terminal interrupting
+  `Stack_overflow` being uncaught in Why3 (it is) and remaining a terminal asynchronous
   exception under OxCaml (the design doc says it is raised via the asynchronous path).
   No source change follows from this; it is just the assumption that makes the "no
   recovery path to break" conclusion hold.
 
 ## Checked and fine
 
-- **`Stack_overflow`** — listed as an interrupting exception by the design doc; Why3 is
+- **`Stack_overflow`** — listed as an asynchronous exception by the design doc; Why3 is
   deeply recursive, but there are **zero** catch sites. It crashes uncaught today and
   stays that way; no behaviour change beyond the (backstopped / benign) skipped clean-up
   in the table above.
@@ -265,7 +265,7 @@ resource safety is the same either way.
     [`why3ide.ml`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/ide/why3ide.ml#L328)):
     "signals" here are GTK UI callbacks, not Unix signals; the only Unix signal influence
     is via the shared scheduler/`prove_client`, which is cooperative. Interruption is the
-    cooperative Interrupt button. No interrupting exception is caught, so the daemon-mode
+    cooperative Interrupt button. No asynchronous exception is caught, so the daemon-mode
     caveat (a recovery loop that stops catching) does not apply — there is nothing it
     catches today.
   - *Web/HTTP server* (`why3web`,
@@ -274,7 +274,7 @@ resource safety is the same either way.
     ([`:283-286`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/ide/wserver.ml#L283-L286))
     and a per-iteration catch-all
     ([`:409-426`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/ide/wserver.ml#L409-L426)).
-    These catch *ordinary* exceptions and keep the server alive. The only interrupting
+    These catch *ordinary* exceptions and keep the server alive. The only asynchronous
     exception that could reach them is `Stack_overflow`; today an uncaught
     `Stack_overflow` in a request would already escape both (it propagates past
     `with exc -> …` only at safe points, and the server is not written to recover from a
@@ -288,19 +288,19 @@ resource safety is the same either way.
     The `with e when not stack_trace -> spa.spa_callback (InternalFailure e)`
     ([`controller_itp.ml:534-535`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/session/controller_itp.ml#L531-L536))
     catches a *synchronous* exception from building one prover call and turns it into an
-    `InternalFailure` value; no interrupting exception is in play.
+    `InternalFailure` value; no asynchronous exception is in play.
 - **One-shot tools** (`why3prove`, `why3replay`, `main`): each has a top-level
   `try … with e when not (Debug.test_flag Debug.stack_trace) -> print; exit 1`
   ([`main.ml:109-118`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/tools/main.ml#L109-L119),
   [`why3prove.ml:211-258`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/tools/why3prove.ml#L211-L258)).
-  These are ordinary-exception reporters. The only interrupting exception that could
+  These are ordinary-exception reporters. The only asynchronous exception that could
   bypass them is `Stack_overflow`; bypassing them just changes the printed message, and
   the process exits either way.
 - **Wildcard handlers** — the handful found
   ([`controller_itp.ml:275`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/session/controller_itp.ml#L275)
   turns a parse failure into a value; [`itp_server.ml:647`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/session/itp_server.ml#L647)
   is a pretty-printing fallback) catch ordinary exceptions only; none restores a
-  persistent invariant that an interrupting `Stack_overflow` would damage.
+  persistent invariant that an asynchronous `Stack_overflow` would damage.
 - **JavaScript build** (`why3_js.ml`, the web worker): no Unix signals, no timers; the
   native asynchronous-exception machinery does not apply. Out of scope.
 
@@ -308,25 +308,25 @@ resource safety is the same either way.
 
 In priority order. The change touches Why3 very little.
 
-1. **No required code change.** There is no interrupting exception that is caught today
+1. **No required code change.** There is no asynchronous exception that is caught today
    and would stop being caught, so there is no regression to fix and no
    `Sys.with_async_exns` boundary that correctness demands. The throwing side is empty
    too (no application exception is raised from any signal handler), so no
    `Sys.raise_async` is needed.
 
 2. **Confirm two runtime facts on OxCaml** (cheap, need the runtime, not the source):
-   that `at_exit` runs on interrupting-uncaught termination (so the `why3server`
+   that `at_exit` runs on asynchronous-uncaught termination (so the `why3server`
    disconnect/reap at [`prove_client.ml:147-149`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/driver/prove_client.ml#L147-L150)
-   still happens), and that `Stack_overflow` remains a terminal interrupting exception.
+   still happens), and that `Stack_overflow` remains a terminal asynchronous exception.
 
 3. **Optional hygiene — convert the four clean-up sites to `new_protect`.**
    `sysutil.ml`'s `write_file_fmt`, `write_unique_file_fmt`, `open_temp_file`, and
    `debug.ml`'s `record_timing` rely on their `finally`/handler running. They are safe
-   today only because the one interrupting exception (`Stack_overflow`) is terminal and
+   today only because the one asynchronous exception (`Stack_overflow`) is terminal and
    their skipped clean-up is either invisible or backstopped. Moving them to the
    interruption-safe bracket is tidy and future-proofs them against a *second*,
-   recoverable interrupting exception ever being introduced. Use a masking bracket that
-   re-throws still-interrupting, not a converting one.
+   recoverable asynchronous exception ever being introduced. Use a masking bracket that
+   re-throws still-asynchronous, not a converting one.
 
 4. **Future feature, not a fix.** If Why3 later wants the GTK IDE or the web server to
    survive a `Stack_overflow` in one proof task instead of dying, add a

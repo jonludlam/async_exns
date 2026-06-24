@@ -49,8 +49,8 @@ enough to use as priors:
      switch left inconsistent, the terminal left in raw mode, a truncated output file
      (opam, utop, Rocq's `.vo`, alcotest's stdout). In-memory-only invariants on a dying
      one-shot process do **not** matter.
-- **The decisive question for any signal-raised exception: interrupting or cooperative?**
-  A `raise` *inside the signal-handler body* is interrupting (affected). A handler that
+- **The decisive question for any signal-raised exception: asynchronous or cooperative?**
+  A `raise` *inside the signal-handler body* is asynchronous (affected). A handler that
   only *sets a flag / writes a pipe*, with the exception raised later at a check-point in
   ordinary code, is **cooperative → an ordinary exception → unaffected**. This one
   distinction settled the verdict for Rocq, Unison, Frama-C and Eio. Read the handler body.
@@ -123,7 +123,7 @@ package; their *absence* is where the bugs are. They are also the fixes to recom
      **normal** path at cooperative points — these are unaffected by the change.
      Only genuinely-async sources (signal handler raise, runtime `Stack_overflow`)
      are in scope. Don't conflate the two. **The concrete tell:** look at the signal
-     handler body — does it `raise` (interrupting, affected), or only set a ref / write
+     handler body — does it `raise` (asynchronous, affected), or only set a ref / write
      a pipe / send an event, with the exception raised later at a check-point in ordinary
      code (cooperative, unaffected)? This is the decisive question; answer it for every
      handler. (The same custom exception, e.g. `Sys.Break` or a `Timeout`, can be either,
@@ -217,7 +217,7 @@ package; their *absence* is where the bugs are. They are also the fixes to recom
    placed **below** the result-conversion (B) handler. Trace the chain to recommend.
    **For a long-lived recovery loop the answer is almost always "per unit of work"**
    (per command / request / test / build), placed *just inside* the loop and *below* the
-   existing per-iteration catch-all — so the interrupting exn becomes ordinary, the
+   existing per-iteration catch-all — so the asynchronous exn becomes ordinary, the
    existing report-and-continue handler fires, and the loop keeps going. A **single high
    wrapper around the whole loop does NOT preserve per-iteration recovery** — it converts
    the exn only after the loop has already been torn down. (Recurred in utop, merlin,
@@ -271,6 +271,12 @@ Format: `https://github.com/<org>/<repo>/blob/<FULL_SHA>/<path>#L<start>-L<end>`
   are affected", "safe today only by luck (fragile)", "code that catches the exception
   to decide what to do next", "where to put the wrapper". Keep real API names
   (`Sys.with_async_exns`, `Sys.raise_async`, `new_protect`) but gloss each once.
+- **Use the standard term "asynchronous exception" — do NOT invent a synonym** (no
+  "interrupting exception" etc.). It is the term the design doc and reviewers use.
+  Define it once in plain terms near the top of each report (e.g. *"an asynchronous
+  exception is an event — pressing Ctrl+C, a timeout going off, or running out of stack —
+  that can surface at almost any point in the program"*), then use it consistently.
+  Ordinary words like "interrupt"/"interruption" are fine in their everyday sense.
 
 ### 1. One-paragraph summary (max one paragraph)
 

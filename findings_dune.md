@@ -4,11 +4,11 @@ Repo: `ocaml/dune` @ `4d89cd6d5f6246996db8c4c12ae5d0ee77836a15` (shallow clone i
 Scope of this pass: a first look for code that works correctly today but would
 break under OxCaml's new handling of "asynchronous exceptions".
 
-An asynchronous exception is an interrupting event — pressing Ctrl+C, a timeout
+An asynchronous exception is an event — pressing Ctrl+C, a timeout
 going off, or running out of stack — that can surface at almost any point in the
-program. Under the new model these interrupting exceptions no longer travel through
+program. Under the new model these asynchronous exceptions no longer travel through
 ordinary `try … with` handlers; an ordinary handler will not catch them. There is a
-new wrapper, `Sys.with_async_exns`, that turns one of these interrupting exceptions
+new wrapper, `Sys.with_async_exns`, that turns one of these asynchronous exceptions
 back into an ordinary one so the normal handlers can see it again.
 
 ## Bottom line
@@ -21,8 +21,8 @@ back into an ordinary one so the normal handlers can see it again.
   code**, so the new model does not change their behaviour at all. There is **no
   `Sys.Break`** anywhere in dune's own code; dune's own cancellation
   (`Build_cancelled`) is an ordinary exception, raised deliberately at safe fiber
-  check-points — not an interrupting one.
-- **The only interrupting exception that actually reaches dune's code is
+  check-points — not an asynchronous one.
+- **The only asynchronous exception that actually reaches dune's code is
   `Stack_overflow`.** It has **no recovery handlers**; the only places it passes
   through are the universal Fiber task wrapper and the top-level reporter, both of
   which catch everything.
@@ -32,7 +32,7 @@ back into an ordinary one so the normal handlers can see it again.
   samples). So nothing needs to be changed to throw it the new way
   (`Sys.raise_async`).
 - **No genuine day-one bug *for one-shot CLI invocations*.** In a normal
-  `dune build`, the one live interrupting exception (`Stack_overflow`) stops the
+  `dune build`, the one live asynchronous exception (`Stack_overflow`) stops the
   process, so nothing observable is corrupted — skipped clean-up doesn't matter
   because the process is exiting.
 - **⚠ Daemon / watch / RPC mode breaks this (see dedicated section).** In
@@ -44,7 +44,7 @@ back into an ordinary one so the normal handlers can see it again.
   ([`build_loop.ml:390`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/build_loop.ml#L390),
   [`:75-94`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/build_loop.ml#L75-L94))
   **waits for the next filesystem change and keeps serving**. Under the new model
-  the interrupting `Stack_overflow` slips past those wrappers, so (1) the daemon
+  the asynchronous `Stack_overflow` slips past those wrappers, so (1) the daemon
   **dies instead of recovering** — a real behaviour change — and (2) the clean-up
   it skips now **leaks/corrupts over the daemon's lifetime** instead of being moot.
   So in daemon mode those wrappers are code that catches the exception to decide
@@ -54,11 +54,11 @@ back into an ordinary one so the normal handlers can see it again.
   (stdune), `Mutex.protect` (stdune), `Fiber.finalize`/`Fiber.protect`, and the
   threaded-console hand-rolled lock/clean-up loop. Each catches the exception only
   to clean up and then re-throw, using a `match … with exception e ->` or
-  `with exn ->` arm that an interrupting `Stack_overflow` bypasses. They are safe
+  `with exn ->` arm that an asynchronous `Stack_overflow` bypasses. They are safe
   today, but only by luck (**only for one-shot runs**, where the process exits
   anyway); in daemon mode they are genuine accumulating leaks (see daemon section).
-  They would also break the instant a *second* interrupting exception (an
-  async-catchable `Sys.Break`, or interrupting finaliser/memprof exceptions) can
+  They would also break the instant a *second* asynchronous exception (an
+  async-catchable `Sys.Break`, or asynchronous finaliser/memprof exceptions) can
   travel through the same scope.
 - **One spot catches the exception to decide what to do next:** the top-level
   [`bin/main.ml:107-118`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/bin/main.ml#L107-L118)
@@ -99,9 +99,9 @@ to `sigwait`, becomes a shutdown event, and the build winds down cooperatively.
 This is the single most important finding — dune already keeps signals from being
 raised as exceptions through user code, which is exactly what the new model assumes.
 
-### `Stack_overflow` — the one live interrupting exception
+### `Stack_overflow` — the one live asynchronous exception
 
-The design doc lists `Stack_overflow` as interrupting (raised by the runtime's
+The design doc lists `Stack_overflow` as asynchronous (raised by the runtime's
 SIGSEGV handler via `caml_raise_async`). Dune is deeply recursive (rule evaluation,
 Memo, S-expr parsing) so it *can* occur. But there are **no** `Stack_overflow`
 handlers in `src/`/`bin/`, so there is no recovery to break — today it is uncaught
@@ -110,7 +110,7 @@ through are the two catch-everything wrappers below (the universal Fiber wrapper
 the top-level reporter), and the change to their behaviour is the subject of the
 verdict table.
 
-### The universal Fiber task wrapper (how an interrupting exception escapes the fiber world)
+### The universal Fiber task wrapper (how an asynchronous exception escapes the fiber world)
 
 Every task run by the fiber scheduler is wrapped by
 [`core.ml:84-96`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L84-L96)
@@ -119,7 +119,7 @@ an ordinary exception into a `Reraise` effect that the fiber error-handler chain
 (`with_error_handler` → `map_reduce_errors` → `collect_errors` →
 [`finalize`, `core.ml:497-509`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509))
 collects and re-raises in an orderly way, running every `~finally`. Under the new
-model an interrupting `Stack_overflow` at a safe point inside `f x` **bypasses this
+model an asynchronous `Stack_overflow` at a safe point inside `f x` **bypasses this
 `with exn ->` arm**: it is *not* turned into a `Reraise`, so it is *not* collected,
 **no `Fiber.finalize ~finally` runs**, and it unwinds straight out of `Fiber.run`
 ([`scheduler.ml:398-418`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_scheduler/scheduler.ml#L398-L418))
@@ -147,24 +147,24 @@ server, dune is **long-lived and recovers from build failures**:
   ([`build_loop.ml:75-94`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/build_loop.ml#L75-L94))
   and serves the next build — **the daemon survives.**
 
-Under the new model an interrupting `Stack_overflow` bypasses both `with exn ->`
+Under the new model an asynchronous `Stack_overflow` bypasses both `with exn ->`
 arms, so:
 
 1. **Recovery is lost (real behaviour change).** A build that overflows the stack
    today is reported and the watch/RPC daemon keeps running; under the new model the
-   interrupting exception propagates past the fiber wrapper and `Run_once`, hits no
+   asynchronous exception propagates past the fiber wrapper and `Run_once`, hits no
    `Sys.with_async_exns`, and **terminates the daemon**. In daemon mode the fiber
    wrapper + `Run_once` catch-all are therefore code that catches the exception to
    decide what to do next (report and recover), not harmless clean-up skips.
 2. **Skipped clean-up now accumulates.** Because the daemon would otherwise keep
-   running, the `~finally`/`unlock`/fd-close clean-ups skipped by the interrupting
+   running, the `~finally`/`unlock`/fd-close clean-ups skipped by the asynchronous
    exception are no longer "moot at process exit" — leaked sandboxes, unreaped
    children, held mutexes and fds **build up over the daemon's lifetime**.
 
 This is triggered rarely (a build deep enough to overflow the stack), but it is a
 genuine regression for the long-lived modes, and it is the one place where dune is
 **not** a clean non-target. Fix: put a `Sys.with_async_exns` wrapper **per build
-iteration** inside the poll loop (turning the interrupting exception back into an
+iteration** inside the poll loop (turning the asynchronous exception back into an
 ordinary one so the existing fiber/`Run_once` machinery reports it and the daemon
 continues), plus making the clean-up helpers interruption-safe so per-build
 resources are released on the way out.
@@ -172,19 +172,19 @@ resources are released on the way out.
 ## Clean-up that could be skipped
 
 All sites catch the exception only to clean up and then re-throw, via an
-`exception e`/`with exn ->` arm (or `Fiber.finalize`) that an interrupting
+`exception e`/`with exn ->` arm (or `Fiber.finalize`) that an asynchronous
 `Stack_overflow` bypasses. No active bug *for one-shot CLI runs* (the process exits
 regardless), so all are **safe today, but only by luck (and therefore fragile)** —
 but see "Daemon / watch / RPC mode" above, where the skipped clean-up accumulates
 and recovery is lost. Worth fixing for hygiene regardless, and because the luck runs
-out the moment a second interrupting exception (an interrupting `Sys.Break`,
+out the moment a second asynchronous exception (an asynchronous `Sys.Break`,
 finaliser/memprof exceptions) can travel through the same scope.
 
 | Site | Cleanup | Verdict | Why |
 |------|---------|---------|-----|
-| [`exn.ml:9-19`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/exn.ml#L9-L19) `Exn.protectx`/`protect` | run `finally x` then `raise e` | safe today, only by luck | The stdune analogue of `Fun.protect`. Used at ~12 sites (`csexp_rpc.ml`, `digest.ml`, `md5.ml`, `ocaml_config.ml`, `async_io.ml`, `scheduler.ml:408`) for fd/socket/cwd clean-up. An interrupting `Stack_overflow` in the body skips `finally`, leaking the fd/leaving cwd changed — but the process is dying anyway, so it goes unnoticed today. This is the doc's "second version of `Fun.protect`" candidate. |
-| [`mutex0.ml:3-12`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/mutex0.ml#L3-L12) `Mutex.protect` | `unlock mutex` then `raise exn` | safe today, only by luck | ~25 callers (scheduler `async_io`, `thread_safe_channel`, `inotify`, `fsevents`, `dune_trace/out`, `alloc`). A skipped unlock would deadlock the owning worker thread, not the build — and only on a `Stack_overflow` inside the (tiny) critical section, after which the process is unwinding to death. Unnoticed today; a real deadlock risk the moment a recoverable interrupting exception enters scope. |
-| [`core.ml:497-509`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509) `Fiber.finalize` / [`fiber.ml:35`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/fiber.ml#L35) `Fiber.protect` | run `finally` fiber, reraise collected errors | safe today, only by luck | The fiber-level clean-up behind process cleanup ([`process.ml:247-253`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/process.ml#L247-L253)), sandbox destroy ([`sandbox.ml:510`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/sandbox.ml#L510)), RPC session close, build-loop cleanup, timeout-task cancel ([`scheduler.ml:502`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_scheduler/scheduler.ml#L502)). An interrupting `Stack_overflow` bypasses `core.ml:84` `apply`'s `with exn ->`, so it never enters the fiber error machinery and **no `~finally` runs** — leaked sandbox dir / unreaped child / undeleted temp. Unnoticed today because it co-occurs with process death; the scheduler's own `kill_and_wait_for_all_processes` + `at_exit` temp cleanup are the actual backstops (see below). |
+| [`exn.ml:9-19`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/exn.ml#L9-L19) `Exn.protectx`/`protect` | run `finally x` then `raise e` | safe today, only by luck | The stdune analogue of `Fun.protect`. Used at ~12 sites (`csexp_rpc.ml`, `digest.ml`, `md5.ml`, `ocaml_config.ml`, `async_io.ml`, `scheduler.ml:408`) for fd/socket/cwd clean-up. An asynchronous `Stack_overflow` in the body skips `finally`, leaking the fd/leaving cwd changed — but the process is dying anyway, so it goes unnoticed today. This is the doc's "second version of `Fun.protect`" candidate. |
+| [`mutex0.ml:3-12`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/mutex0.ml#L3-L12) `Mutex.protect` | `unlock mutex` then `raise exn` | safe today, only by luck | ~25 callers (scheduler `async_io`, `thread_safe_channel`, `inotify`, `fsevents`, `dune_trace/out`, `alloc`). A skipped unlock would deadlock the owning worker thread, not the build — and only on a `Stack_overflow` inside the (tiny) critical section, after which the process is unwinding to death. Unnoticed today; a real deadlock risk the moment a recoverable asynchronous exception enters scope. |
+| [`core.ml:497-509`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509) `Fiber.finalize` / [`fiber.ml:35`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/fiber.ml#L35) `Fiber.protect` | run `finally` fiber, reraise collected errors | safe today, only by luck | The fiber-level clean-up behind process cleanup ([`process.ml:247-253`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/process.ml#L247-L253)), sandbox destroy ([`sandbox.ml:510`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/sandbox.ml#L510)), RPC session close, build-loop cleanup, timeout-task cancel ([`scheduler.ml:502`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_scheduler/scheduler.ml#L502)). An asynchronous `Stack_overflow` bypasses `core.ml:84` `apply`'s `with exn ->`, so it never enters the fiber error machinery and **no `~finally` runs** — leaked sandbox dir / unreaped child / undeleted temp. Unnoticed today because it co-occurs with process death; the scheduler's own `kill_and_wait_for_all_processes` + `at_exit` temp cleanup are the actual backstops (see below). |
 | [`dune_threaded_console.ml:89-154`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_threaded_console/dune_threaded_console.ml#L89-L154) console event loop | `| exn -> Mutex.lock; cleanup (Some exn)` (re-acquire mutex, unlock, broadcast `finish_cv`) | safe today, only by luck (low severity) | Runs in a dedicated console thread; `render`/`handle_user_events` are shallow so `Stack_overflow` is improbable, and the clean-up it would skip (unlock + `Condition.broadcast finish_cv`) only matters for orderly shutdown of a thread that is itself dying. Diagnostic/UI bookkeeping, no soundness or build-result impact. |
 
 (There are **no** `Fun.protect` uses and **no** hand-rolled `match … with exception
@@ -193,9 +193,9 @@ through these, which is convenient: fixing the helpers fixes the callers.)
 
 ## Why this is subtle
 
-1. **Today's catching is unpredictable** *in principle* — an interrupting exception
+1. **Today's catching is unpredictable** *in principle* — an asynchronous exception
    fires at an arbitrary safe point and is caught by whichever catch-everything
-   handler is innermost. But in dune the only live interrupting exception is
+   handler is innermost. But in dune the only live asynchronous exception is
    `Stack_overflow`, which nobody recovers from, so in practice the only observable
    effect today is: the universal Fiber wrapper or the top-level reporter catches
    it, clean-up runs on the way out, dune prints an "Internal error / Uncaught
@@ -204,11 +204,11 @@ through these, which is convenient: fixing the helpers fixes the callers.)
    make a decision:
    ```
    bin/main.ml:107  | exn -> Report_error.report exn; exit        <- report + flush + abort  (wrapper candidate)
-     scheduler.ml:411  Fiber.run ... | exception exn -> Error (Exn ...) <- orderly capture (bypassed by interrupting exn)
-       core.ml:84  apply: try f x with exn -> Reraise              <- enters fiber error machinery (bypassed by interrupting exn)
+     scheduler.ml:411  Fiber.run ... | exception exn -> Error (Exn ...) <- orderly capture (bypassed by asynchronous exn)
+       core.ml:84  apply: try f x with exn -> Reraise              <- enters fiber error machinery (bypassed by asynchronous exn)
          Fiber.finalize / Exn.protect / Mutex.protect              <- cleanup, then RE-RAISE
    ```
-   Under the new model an interrupting `Stack_overflow` skips the three inner
+   Under the new model an asynchronous `Stack_overflow` skips the three inner
    `with exn ->` frames entirely (no clean-up, no orderly capture) and reaches
    `bin/main.ml`'s catch-everything handler — which *also* will not catch it unless
    wrapped in `Sys.with_async_exns`.
@@ -222,7 +222,7 @@ The change splits in two:
   because `Stack_overflow` is process-fatal and the scheduler/`at_exit` backstops
   cover the externally-visible resources).
 - **Dependent on where the wrapper goes:** whether the top-level reporter still
-  fires. With no `Sys.with_async_exns`, an uncaught interrupting `Stack_overflow`
+  fires. With no `Sys.with_async_exns`, an uncaught asynchronous `Stack_overflow`
   stops the program *without* the `Report_error.report` diagnostic and *without* the
   `Console.finish ()` flush on the direct path (the `at_exit` flush still runs — see
   below).
@@ -232,14 +232,14 @@ The change splits in two:
 | Site kind | Sites | Fix | Difficulty |
 |-----------|-------|-----|------------|
 | Resource / lock / invariant clean-up — only needs "finaliser must run" | `Exn.protectx`/`protect` ([`exn.ml:9`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/exn.ml#L9-L19)), `Mutex.protect` ([`mutex0.ml:3`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/mutex0.ml#L3-L12)), `Fiber.finalize`/`protect` ([`core.ml:497`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509)), threaded-console loop | an interruption-safe version of the clean-up helper (`new_protect`) that runs the clean-up, then re-throws the interruption unchanged — fix the *helper*, callers inherit it | mechanical, ~4 definitions |
-| Catches the exception to decide what to do next — *consumes* the exn, makes a control-flow decision | top-level [`bin/main.ml:107-118`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/bin/main.ml#L107-L118) | `Sys.with_async_exns` wrapper if dune wants to keep reporting/flushing on interrupting termination | design call |
+| Catches the exception to decide what to do next — *consumes* the exn, makes a control-flow decision | top-level [`bin/main.ml:107-118`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/bin/main.ml#L107-L118) | `Sys.with_async_exns` wrapper if dune wants to keep reporting/flushing on asynchronous termination | design call |
 
 **Caveat — two re-throw modes.** A `new_protect` that runs the clean-up and then
-re-throws the *interrupting* exception unchanged frees the resource but keeps the
+re-throws the *asynchronous* exception unchanged frees the resource but keeps the
 exception flying past downstream ordinary handlers (you still need the explicit
 `with_async_exns` at the top if you want the diagnostic). A `new_protect` that
 instead turns it back into an *ordinary* exception would silently re-enable
-downstream `with exn ->`/`with _ ->` swallowing of any future interrupting
+downstream `with exn ->`/`with _ ->` swallowing of any future asynchronous
 `Sys.Break` — against the model. Best reading: re-throw the interruption unchanged
 in the helper + (optionally) one explicit `with_async_exns` at `bin/main.ml`. The
 four clean-up helpers are resource-safe under either mode.
@@ -258,7 +258,7 @@ every caller.
 - **`Build_cancelled` is an ordinary, deliberate exception** — dune's own
   cancellation, raised at safe fiber check-points
   ([`scheduler.ml:27-34`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_scheduler/scheduler.ml#L27-L34)),
-  caught at `build_system.ml:1090`/`action_exec.ml:99`. Not interrupting;
+  caught at `build_system.ml:1090`/`action_exec.ml:99`. Not asynchronous;
   unaffected.
 - **Memprof callbacks don't raise** — the tracker
   ([`alloc.ml:169-186`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_trace/alloc.ml#L169-L186))
@@ -273,7 +273,7 @@ every caller.
   [`rev_store.ml:198`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_pkg/rev_store.ml#L198),
   RPC socket unlink, `Dune_trace.at_exit`). So the externally-visible clean-up that
   the skipped `Fiber.finalize` brackets would have done is *also* covered by
-  `at_exit` — **provided OxCaml's interrupting-uncaught path runs `at_exit`** (one
+  `at_exit` — **provided OxCaml's asynchronous-uncaught path runs `at_exit`** (one
   confirmation needed on the OxCaml runtime).
 
 ## Open questions (design calls / runtime confirmations)
@@ -281,19 +281,19 @@ every caller.
 - **Where to put the wrapper — two candidates.**
   - *One-shot CLI (low stakes):* the top-level
     [`bin/main.ml:107-118`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/bin/main.ml#L107-L118).
-    Wrap `Cmd.eval_value` in `Sys.with_async_exns` so an uncaught interrupting
+    Wrap `Cmd.eval_value` in `Sys.with_async_exns` so an uncaught asynchronous
     `Stack_overflow` still becomes the standard "Internal error" report +
     `Console.finish ()` flush rather than a bare termination. The `at_exit` flush
     survives either way; the only loss is the pretty diagnostic.
   - *Daemon / watch / RPC (real stakes):* a `Sys.with_async_exns` wrapper **per
     build iteration** in the poll loop
     ([`build_loop.ml:390`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/build_loop.ml#L390),
-    around the `Run_once.run` build), so an interrupting `Stack_overflow` is turned
+    around the `Run_once.run` build), so an asynchronous `Stack_overflow` is turned
     back into an ordinary exception, caught by the existing fiber/`Run_once`
     machinery, reported, and the daemon **continues** — preserving today's
     crash-recovery. This is the genuine design decision (where exactly to wrap).
 - **OxCaml confirmations** (need the runtime, not the source): (1) `at_exit` runs on
-  interrupting-uncaught termination (so temp-file/trace cleanup survives); (2) the
+  asynchronous-uncaught termination (so temp-file/trace cleanup survives); (2) the
   behaviour of a `Stack_overflow` that occurs *inside a worker/console/scheduler
   thread* under the new model (does it terminate just the domain/thread or the
   process?).
@@ -327,7 +327,7 @@ is preserving daemon-mode crash-recovery.
 
 0. **Daemon/watch/RPC: add a per-build-iteration `Sys.with_async_exns` wrapper**
    ([`build_loop.ml:390`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/build_loop.ml#L390),
-   around `Run_once.run`) so an interrupting `Stack_overflow` in a build is turned
+   around `Run_once.run`) so an asynchronous `Stack_overflow` in a build is turned
    back into an ordinary exception, caught by the existing fiber/`Run_once`
    reporter, and the daemon keeps serving instead of dying. This is the one place
    dune has a real behaviour change; pair it with (1) so per-build resources are
@@ -339,16 +339,16 @@ is preserving daemon-mode crash-recovery.
    and `Fiber.finalize`/`Fiber.protect` ([`core.ml:497`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509),
    [`fiber.ml:35`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/fiber.ml#L35))
    as interruption-safe helpers (`new_protect`) so the finaliser/unlock runs even
-   when an interrupting exception unwinds. Have them re-throw the interruption
+   when an asynchronous exception unwinds. Have them re-throw the interruption
    unchanged, **not** turn it back into an ordinary exception — turning it back
-   would re-enable downstream catch-everything swallowing of a future interrupting
+   would re-enable downstream catch-everything swallowing of a future asynchronous
    `Sys.Break`. This single change covers all ~40 call sites without touching them.
    Also harden the threaded-console loop
    ([`dune_threaded_console.ml:89`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_threaded_console/dune_threaded_console.ml#L89-L154)).
 
 2. **Decide where to put the top-level wrapper (the one design call).** Optionally
    wrap `Cmd.eval_value` at [`bin/main.ml:107-118`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/bin/main.ml#L107-L118)
-   in `Sys.with_async_exns` so an uncaught interrupting `Stack_overflow` still
+   in `Sys.with_async_exns` so an uncaught asynchronous `Stack_overflow` still
    reaches the `| exn -> Report_error.report exn; exit` reporter (pretty diagnostic
    + `Console.finish` flush) instead of terminating bare. Low stakes.
 
@@ -357,7 +357,7 @@ is preserving daemon-mode crash-recovery.
    throwing side (`Sys.raise_async`).
 
 4. **Confirm on the OxCaml runtime** (not derivable from source): `at_exit` runs on
-   interrupting-uncaught termination (preserving temp-file/trace cleanup); and
+   asynchronous-uncaught termination (preserving temp-file/trace cleanup); and
    whether a worker/console-thread `Stack_overflow` kills just that thread or the
    whole process.
 
@@ -365,4 +365,4 @@ is preserving daemon-mode crash-recovery.
 optional add-on; (3) is a no-op confirmation; (4) gates how much (1)/(2) actually
 buy you. **Do *not*** reimplement the helpers to turn the interruption back into an
 ordinary exception — that would re-enable downstream catch-everything swallowing of
-a future interrupting `Sys.Break`, defeating the model.
+a future asynchronous `Sys.Break`, defeating the model.

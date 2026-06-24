@@ -4,16 +4,16 @@ Repo: `OCamlPro/alt-ergo` @ `4471dadc` (shallow clone in `./alt-ergo`).
 What this pass covers: a first search for code that works correctly today but
 would break under OxCaml's new rules for "asynchronous exceptions".
 
-Background in one sentence: an *asynchronous exception* is an interrupting event
+Background in one sentence: an *asynchronous exception* is an event
 — pressing Ctrl+C, a time-limit going off, or running out of stack — that can
 surface at almost any point in the program. Today an ordinary `try … with`
 catches these; under the new rules it does not, unless you use a new wrapper
-(`Sys.with_async_exns`) that turns the interrupting exception back into an
-ordinary one. We call these "interrupting exceptions" below.
+(`Sys.with_async_exns`) that turns the asynchronous exception back into an
+ordinary one. We call these "asynchronous exceptions" below.
 
 ## Bottom line
 
-- In Alt-Ergo, only **one** exception travels this new interrupting route:
+- In Alt-Ergo, only **one** exception travels this new asynchronous route:
   `Util.Timeout`, raised from the `SIGVTALRM`/`ITIMER_VIRTUAL` signal handler.
   Nothing else is affected — Ctrl+C calls `exit` directly, and there is no caught
   `Stack_overflow` or `Out_of_memory`, and no finalisers.
@@ -35,7 +35,7 @@ ordinary one. We call these "interrupting exceptions" below.
 ## Which exception is affected: `Util.Timeout`
 
 Alt-Ergo's timeout is a CPU-time timer that raises an exception **from inside a
-signal handler** — which is exactly an interrupting exception under the new model.
+signal handler** — which is exactly an asynchronous exception under the new model.
 
 - Installed: `signals_profiling.ml:69-73` sets the `SIGVTALRM` handler to
   `fun _ -> Options.exec_timeout ()`.
@@ -47,7 +47,7 @@ signal handler** — which is exactly an interrupting exception under the new mo
   and the outermost `solving_loop.ml:269` / `solving_loop.ml:854`.
 
 Because the timer can fire at **any** safe point, `Util.Timeout` is the only
-interrupting exception this program can produce this way (see "Checked and fine"
+asynchronous exception this program can produce this way (see "Checked and fine"
 for why nothing else applies).
 
 This has two separate consequences under the new rules:
@@ -57,7 +57,7 @@ This has two separate consequences under the new rules:
    exception escaping the handler as a fatal one). Without this, raising
    `Util.Timeout` from the handler *stops the program*.
 2. **Catching side (investigation point 1):** none of the `with Util.Timeout ->`
-   handlers will fire anymore — an interrupting `Util.Timeout` jumps straight to the
+   handlers will fire anymore — an asynchronous `Util.Timeout` jumps straight to the
    nearest `Sys.with_async_exns` wrapper, or stops the program. So we need such a
    wrapper, and we need to decide *where* to put it.
 
@@ -69,23 +69,23 @@ not affect it. There is no use of `Sys.Break` anywhere.)
 
 All four sites below restore state or release a resource through a handler or
 `Fun.protect ~finally`, and that clean-up will **no longer run** when `Util.Timeout`
-arrives as an interrupting exception. But after tracing each one, only **one is an
+arrives as an asynchronous exception. But after tracing each one, only **one is an
 active bug**. The others are safe today only by luck — for an incidental reason (state
 is re-initialised at the next use, or the timer is one-shot), not because the clean-up
 is unnecessary. That makes them **fragile**, not broken — they should still move to
 `new_protect` (see "How to fix it"), both for tidiness and because the lucky accident
-protecting them disappears the moment a *second* interrupting exception (e.g. a
+protecting them disappears the moment a *second* asynchronous exception (e.g. a
 catchable `Sys.Break`) could pass through the same code.
 
 | Site | Clean-up | Verdict | Why |
 |------|---------|---------|-----|
 | `steps.ml:206-215` `apply_without_step_limit` | restore `steps_bound` (`exception e -> steps_bound := bound; raise e`) | **GENUINE BUG** | `steps_bound` is a long-lived global (set only by `--steps-bound` / `set_steps_bound`; *not* reset per goal — `reset_steps` only zeroes counters). A timeout during the wrapped `SAT.push` (`frontend.ml:297`) leaves it stuck at `-1`, which **silently disables the step limit for the rest of the session** (`steps.ml:148` `!steps_bound <> -1 && …`). A lasting broken invariant. |
 | `matching.ml:664-671` `query` | `reset_cache_refs ()` (`with e -> reset_cache_refs (); raise e`) | safe today, only by luck | `query` also calls `reset_cache_refs ()` at its **start** (`matching.ml:662`), and the caches (`cache_are_equal_light/full`) are module-private, query-local memoization. The next `query` resets them before any read, so a skipped trailing reset only **keeps the maps in memory** until then — no broken invariant. Fragile if those caches ever gain a reader outside `query`. |
-| `options.ml:939` `Time.with_timeout` | `Fun.protect ~finally:unset_timeout` | safe today, only by luck | `ITIMER_VIRTUAL` is **one-shot** (`it_interval = 0.`, `options.ml:926`). The *only* exception that skips `finally` is `Util.Timeout` — i.e. the timer having **already fired and spent itself**. So no live timer leaks into the next goal. It becomes a real leak only if a second interrupting exception (Ctrl+C) can unwind through `with_timeout` while the timer is still armed. |
+| `options.ml:939` `Time.with_timeout` | `Fun.protect ~finally:unset_timeout` | safe today, only by luck | `ITIMER_VIRTUAL` is **one-shot** (`it_interval = 0.`, `options.ml:926`). The *only* exception that skips `finally` is `Util.Timeout` — i.e. the timer having **already fired and spent itself**. So no live timer leaks into the next goal. It becomes a real leak only if a second asynchronous exception (Ctrl+C) can unwind through `with_timeout` while the timer is still armed. |
 | `timers.ml:353-359` `with_timer` | `Fun.protect ~finally:timer_pause` | low severity (diagnostic) | profiling-only; see below. |
 
 `Fun.protect` matters twice over: the design doc says it will **not** catch
-interrupting exceptions, and a second, interruption-aware variant is wanted. All three
+asynchronous exceptions, and a second, interruption-aware variant is wanted. All three
 `Fun.protect`/handler sites rely on `finally` running on a timeout.
 
 ## `timers.ml` `with_timer` — low-severity detail (diagnostics only)
@@ -93,7 +93,7 @@ interrupting exceptions, and a second, interruption-aware variant is wanted. All
 - **`timers.ml:353-359` `with_timer`** (`Fun.protect ~finally:(fun _ -> !timer_pause …)`).
   `start` (`timers.ml:295-309`) *pushes* the current timer onto `env.stack`; `pause`
   (`312-321`) *pops* it — so the `finally` keeps a nested timer **stack** balanced. An
-  interrupting `Util.Timeout` skipping it leaves a dangling stack entry / wrong
+  asynchronous `Util.Timeout` skipping it leaves a dangling stack entry / wrong
   durations. But:
   - it is gated on `Options.get_timers ()` (off by default);
   - it is pure **profiling/timing bookkeeping** (`TimerTable` elapsed-time
@@ -144,7 +144,7 @@ So the change splits into two parts:
   *matters* is per-site (see the clean-up table): `steps.ml` is an active bug,
   `matching.ml` is safe today by luck.
 - **Dependent on where the wrapper goes:** which *final* handler "wins". The wrapper
-  turns an interrupting exception back into an ordinary one *at its location*, so any
+  turns an asynchronous exception back into an ordinary one *at its location*, so any
   handler nested *below* the wrapper (e.g. `satml_frontend`'s `i_dont_know`) is
   bypassed. Putting the wrapper high up turns "graceful per-goal unknown" into
   "whole-run exit"; preserving the graceful answer requires placing the wrapper *below*
@@ -162,17 +162,17 @@ needs from the exception*:
 | Site kind | Sites | Fix | Difficulty |
 |-----------|-------|-----|------------|
 | Resource / invariant clean-up — only needs "the finaliser must run" | `options.ml:939`, `timers.ml:353`, `matching.ml:664`, `steps.ml:206` | `new_protect` | mechanical, local |
-| Catches the exception to decide what to do next — *consumes* the timeout and makes a control-flow decision | `satml_frontend.ml` `i_dont_know`, `solving_loop.ml` `exit_as_timeout` | `Sys.with_async_exns` wrapper (or rewrite the handler to catch the interrupting exception) | design call (where to put the wrapper) |
+| Catches the exception to decide what to do next — *consumes* the timeout and makes a control-flow decision | `satml_frontend.ml` `i_dont_know`, `solving_loop.ml` `exit_as_timeout` | `Sys.with_async_exns` wrapper (or rewrite the handler to catch the asynchronous exception) | design call (where to put the wrapper) |
 
 The clean-up sites are not just rewritable but **race-improved** by the
 `init`/`finaliser` shape: e.g. `Time.with_timeout` currently arms the timer
 (`set_timeout`) *inside* the protected body; moving the arming into `init` lets the
-bracket hold off interrupting exceptions across the arm→enter transition, closing the
+bracket hold off asynchronous exceptions across the arm→enter transition, closing the
 gap where a timeout could land between arming the timer and entering `f`.
 
 **Caveat — how it re-throws.** Whether `new_protect` *on its own* restores the old
 end-to-end behaviour depends on how it re-throws after the finaliser:
-- re-throw as **still-interrupting**: the resource is freed, but the exception keeps
+- re-throw as **still-asynchronous**: the resource is freed, but the exception keeps
   flying past downstream ordinary handlers → you *still* need an outer
   `with_async_exns` for the graceful-unknown result.
 - re-throw as **ordinary**: `new_protect` doubles as a conversion point — which would
@@ -181,7 +181,7 @@ end-to-end behaviour depends on how it re-throws after the finaliser:
 
 For pure **resource safety** at the four clean-up sites it doesn't matter which. The
 best reading of the doc's intent is the version that holds off interruptions and
-re-throws still-interrupting, so `new_protect` (4 sites) and one `with_async_exns`
+re-throws still-asynchronous, so `new_protect` (4 sites) and one `with_async_exns`
 wrapper (2 sites) are **complementary, not substitutes**.
 
 ## Resolved during this pass
@@ -192,21 +192,21 @@ wrapper (2 sites) are **complementary, not substitutes**.
   `model_gen_on_timeout` / `update_model_and_return_unknown` variants additionally
   compute a *best-effort* model (re-arming the one-shot timer for a model-generation
   phase). All of this is **producing a result, not restoring an invariant** — if an
-  interrupting timeout bypasses it you get a *degraded result* (a raw timeout at the
+  asynchronous timeout bypasses it you get a *degraded result* (a raw timeout at the
   wrapper, no partial model), not corruption. So these stay in the
   catch-to-decide bucket; none are hidden `new_protect` sites.
 - **`at_exit` runs on uncaught exceptions** — verified empirically on OCaml 5.4.1: a
   program dying from an uncaught `Not_found` *and* from `Stack_overflow` both run the
   `at_exit` callback (exit code 2). So `Output.close_all` (`parse_command.ml:1562`)
-  still flushes even on an uncaught interrupting termination — *provided OxCaml's
-  interrupting-termination path matches stock uncaught behaviour* (worth one
+  still flushes even on an uncaught asynchronous termination — *provided OxCaml's
+  asynchronous-termination path matches stock uncaught behaviour* (worth one
   confirmation on OxCaml). Moot anyway once the wrapper is placed (timeout → normal
   exit). **Low concern.**
 - **The `satml_frontend.ml:1085` / model-generation `set_timeout` re-arm dances are
   fine** — same one-shot-timer reasoning as `options.ml:939`: every re-arm is a fresh
   one-shot, and the only exception that skips a finally/handler is the timer firing
   itself, which spends it. No `ITIMER_VIRTUAL` can leak into the next goal while
-  `Util.Timeout` is the only interrupting exception in play.
+  `Util.Timeout` is the only asynchronous exception in play.
 
 ## Open questions (design calls, not investigations)
 
@@ -217,14 +217,14 @@ wrapper (2 sites) are **complementary, not substitutes**.
   graceful per-goal "unknown(timeout)" (see "Why this is subtle"). This is the one
   genuinely unresolved design decision.
 - **OxCaml confirmations** (cheap, need the OxCaml runtime, not the source): that
-  `at_exit` runs on interrupting-uncaught termination; and that `alt-ergo-js` truly
+  `at_exit` runs on asynchronous-uncaught termination; and that `alt-ergo-js` truly
   never arms `Unix.setitimer`.
 
 ## Checked and fine
 
-- **`Stack_overflow`** — listed as an interrupting exception by the doc, and Alt-Ergo
+- **`Stack_overflow`** — listed as an asynchronous exception by the doc, and Alt-Ergo
   is deeply recursive, but there are **zero catch sites**. It already crashes uncaught;
-  interrupting or not, no behaviour change.
+  asynchronous or not, no behaviour change.
 - **`Out_of_memory`** — **zero catch sites**, so the doc's "OOM from the GC becomes
   fatal" change breaks no recovery path here.
 - **`Gc.finalise`** — none. The only GC callback is `Gc.create_alarm` in `gc_debug.ml`
@@ -235,21 +235,21 @@ wrapper (2 sites) are **complementary, not substitutes**.
   periodic profiling prints — harmless.) No `Sys.Break` anywhere.
 - **Wildcard handlers** — 7 total; the only one that restores state is `matching.ml:669`
   (covered in the clean-up table above). The rest: `with _ -> assert false`
-  impossible-case guards (`theory.ml:157`, `satml.ml:643` — an interrupting exception
+  impossible-case guards (`theory.ml:157`, `satml.ml:643` — an asynchronous exception
   skipping them is, if anything, *more* correct); a `with _ -> false` char check
   (`frontend.ml:312`); a pure memoization fallback (`models.ml:145`); startup
   plugin-load error reporting (`config.ml:50`, outside any timeout scope).
 - **Plugins (`fm-simplex`)** — no `Timeout` catches, no signals, no
   `Fun.protect`/clean-up. Clean.
 - **JS / worker build (`worker_js.ml`)** — no signals; its `Timeout _` is a result-type
-  *pattern match*, not an exception catch. Interrupting exceptions are a native-runtime
+  *pattern match*, not an exception catch. Asynchronous exceptions are a native-runtime
   concern, so `alt-ergo-js` is essentially out of scope (worth a one-line confirmation
   that `Unix.setitimer` is unused/stubbed there).
 
 ## Recommendations
 
 In priority order. The whole change is small and localized — there is exactly one
-interrupting exception (`Util.Timeout`) to reason about.
+asynchronous exception (`Util.Timeout`) to reason about.
 
 1. **Make the timeout throw the new way (required, or nothing else matters).** Change
    the `SIGVTALRM` handler so `Util.Timeout` leaves the handler via `Sys.raise_async`
@@ -272,20 +272,20 @@ interrupting exception (`Util.Timeout`) to reason about.
 4. **Convert the three fragile clean-up sites to `new_protect` for robustness:**
    `options.ml:939` `with_timeout`, `timers.ml:353` `with_timer`, `matching.ml:664`
    `query`. Safe today (one-shot timer / defensive re-init / profiling-only), but they
-   break the instant a second interrupting exception (e.g. a catchable `Sys.Break`) can
+   break the instant a second asynchronous exception (e.g. a catchable `Sys.Break`) can
    pass through them. Prefer the `init`/`finaliser` shape — it also closes the
    arm→enter race in `with_timeout`.
 
 5. **Confirm on the OxCaml runtime** (not derivable from source): that `at_exit` runs
-   on interrupting-uncaught termination (so `Output.close_all` still flushes), and that
+   on asynchronous-uncaught termination (so `Output.close_all` still flushes), and that
    `alt-ergo-js` never arms `Unix.setitimer`.
 
 **Sequencing note:** (1) and (2) are coupled and must land together — (1) alone turns
 every timeout into a program exit; (2) alone does nothing. (3) is independent and can
 land first. (4) is tidy-up/future-proofing and can land anytime.
 
-**Do *not*** reflexively wrap clean-up in a converting (interrupting→ordinary) bracket:
+**Do *not*** reflexively wrap clean-up in a converting (asynchronous→ordinary) bracket:
 that would re-enable downstream `with _ ->` swallowing of `Sys.Break`/timeouts,
 defeating the point of the new model. Use a bracket that holds off interruptions and
-re-throws them still-interrupting, paired with the single explicit `with_async_exns`
+re-throws them still-asynchronous, paired with the single explicit `with_async_exns`
 from (2).

@@ -12,22 +12,21 @@ optional network server.
 A few kinds of event can interrupt an OCaml program at almost any moment: running out
 of stack space, pressing Ctrl+C, or an exception thrown from a signal handler, a GC
 finaliser, or a memprof callback. Today these surface as ordinary exceptions, so a
-normal `try … with` catches them. OxCaml changes this: these interrupting exceptions
+normal `try … with` catches them. OxCaml changes this: these asynchronous exceptions
 now travel a separate route, an ordinary `try … with` no longer catches them, and
 unless the program wraps the right region in a new special handler
-(`Sys.with_async_exns`, which turns an interrupting exception back into an ordinary one
+(`Sys.with_async_exns`, which turns an asynchronous exception back into an ordinary one
 so normal handlers see it again) the exception flies straight past every normal handler
-and either reaches that wrapper or stops the program. Below we call them "interrupting
-exceptions".
+and either reaches that wrapper or stops the program.
 
 ## Bottom line
 
-- **Irmin installs nothing that produces an interrupting exception of its own.** There
+- **Irmin installs nothing that produces an asynchronous exception of its own.** There
   is no `Sys.catch_break`, no `Sys.set_signal`/`Sys.signal` with an OCaml handler that
   raises, no `Stdlib.Gc.finalise`, no memprof callback, and no `setitimer`/`Unix.alarm`
   anywhere in Irmin's own code. So Irmin produces **no `Sys.Break`** and raises nothing
   from a finaliser or signal handler.
-- **The only interrupting exception that can actually reach Irmin's code is
+- **The only asynchronous exception that can actually reach Irmin's code is
   `Stack_overflow`** (plus `Out_of_memory` only in its synchronous, non-GC form — the
   design doc makes GC out-of-memory fatal). Irmin walks deep, possibly cyclic object
   graphs (commit history, trees, lowest-common-ancestor search), so `Stack_overflow`
@@ -52,8 +51,8 @@ exceptions".
   reads as the previous consistent state. An interruption part-way through a write
   therefore loses at most the latest, not-yet-committed data — it does **not** corrupt
   the store. This is the same guarantee the backend already gives against a power-cut,
-  so an interrupting `Stack_overflow` mid-write is no worse.
-- **The clean-up that an interrupting `Stack_overflow` would skip lives behind a small
+  so an asynchronous `Stack_overflow` mid-write is no worse.
+- **The clean-up that an asynchronous `Stack_overflow` would skip lives behind a small
   number of brackets, and on inspection each is either in-memory-only (moot once the
   process dies) or backstopped.** The on-disk backend funnels resource clean-up through
   two helpers, `Errors.finalise` and `Errors.finalise_exn`
@@ -67,7 +66,7 @@ exceptions".
   `Lwt.catch` arm, logs it, replies with an error, and keeps serving the next request
   ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135)).
   Today a `Stack_overflow` during one request is caught there and the server recovers.
-  Under OxCaml the interrupting `Stack_overflow` bypasses that `Lwt.catch` and **stops
+  Under OxCaml the asynchronous `Stack_overflow` bypasses that `Lwt.catch` and **stops
   the server process** instead of recovering. This is the only place Irmin's current
   behaviour visibly changes, and it needs a `Sys.with_async_exns` wrapper if the
   recover-and-continue behaviour is to be kept.
@@ -79,7 +78,7 @@ exceptions".
 
 ## Which exceptions are affected
 
-### Irmin produces no interrupting exception of its own
+### Irmin produces no asynchronous exception of its own
 
 A search of the whole tree for the usual sources finds none in Irmin's own code:
 
@@ -126,7 +125,7 @@ There is **no** `with Stack_overflow ->`, no `with Out_of_memory ->`, and no bar
 `Stack_overflow` is therefore uncaught and fatal today; under OxCaml it remains
 uncaught and fatal. No recovery behaviour regresses.
 
-### How an interrupting `Stack_overflow` leaves a write part-way
+### How an asynchronous `Stack_overflow` leaves a write part-way
 
 The write path is `batch`
 ([`store.ml:404-444`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L404-L444)).
@@ -140,7 +139,7 @@ and flushes:
   ([`store.ml:427-442`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L427-L442)).
 
 `Lwt.try_bind` keys `on_fail` off the body *resolving to a failed promise* on the
-normal path. An interrupting `Stack_overflow` raised inside the body does not become a
+normal path. An asynchronous `Stack_overflow` raised inside the body does not become a
 failed promise — it bypasses `on_fail`, so `during_batch` is left `true` and the trailing
 flush is skipped. But `during_batch` is purely in-memory state, and a skipped flush only
 means the latest buffered data is not written. Because the on-disk commit point is the
@@ -151,22 +150,22 @@ instant. Nothing is corrupted; at most the most recent un-committed writes are l
 ## Clean-up that could be skipped
 
 All the sites below run clean-up via an `Errors.finalise`/`finalise_exn`/`Lwt.try_bind`/
-`Lwt.finalize` arm that an interrupting `Stack_overflow` would bypass. Verdicts assume a
+`Lwt.finalize` arm that an asynchronous `Stack_overflow` would bypass. Verdicts assume a
 one-shot program (CLI command or library call inside a host app); the long-lived server
 is treated separately below.
 
 | Site | Cleanup | Verdict | Why |
 |------|---------|---------|-----|
-| [`store.ml:404-444`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L404-L444) `batch` | `Lwt.try_bind` whose `on_fail` clears `during_batch` and flushes | safe today, only by luck | An interrupting `Stack_overflow` in the body skips `on_fail`, leaving the in-memory `during_batch` flag stuck `true` and the final flush un-done. The flag is in-memory only (gone when the process dies); the skipped flush loses only not-yet-committed data and cannot corrupt the store, because the on-disk commit point is the atomic control-file rename. No on-disk damage. Becomes a real concern only if the same repository handle is reused after recovering from the overflow (see the server, below). |
-| [`errors.ml:22-25`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L22-L25) `Errors.finalise` | runs `finaliser res` after the body returns | safe today, only by luck | This is the success-only finaliser used to close short-lived read handles, e.g. the legacy-file readers `read_offset_from_legacy_file` / `read_version_from_legacy_file` ([`file_manager.ml:650-672`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/file_manager.ml#L650-L672)). It does not even run the finaliser on a *synchronous* exception today (it only wraps the success path), so an interrupting `Stack_overflow` skipping it changes nothing about the synchronous-failure case. The skipped close leaks one file descriptor, released by the OS at process exit. |
-| [`errors.ml:28-35`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L28-L35) `Errors.finalise_exn` | `try … finaliser (Some res) with exn -> finaliser None; raise exn` | safe today, only by luck → fragile | The proper clean-up bracket: it *does* run the finaliser on a synchronous exception and re-raise. An interrupting `Stack_overflow` bypasses the `with exn ->` arm, so the finaliser is skipped. Its callers are inside the forked GC worker ([`gc_worker.ml:229`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/gc_worker.ml#L229), [`:274`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/gc_worker.ml#L274), [`:297`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/gc_worker.ml#L297)) and the GC `finalise_exn` ([`store.ml:281-297`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L281-L297)). The GC writes its result to its own files and the parent re-derives state from the control file, so a skipped finaliser there means at most a leftover temp file / fd, not store corruption. Worth converting for hygiene; not a day-one bug. |
+| [`store.ml:404-444`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L404-L444) `batch` | `Lwt.try_bind` whose `on_fail` clears `during_batch` and flushes | safe today, only by luck | An asynchronous `Stack_overflow` in the body skips `on_fail`, leaving the in-memory `during_batch` flag stuck `true` and the final flush un-done. The flag is in-memory only (gone when the process dies); the skipped flush loses only not-yet-committed data and cannot corrupt the store, because the on-disk commit point is the atomic control-file rename. No on-disk damage. Becomes a real concern only if the same repository handle is reused after recovering from the overflow (see the server, below). |
+| [`errors.ml:22-25`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L22-L25) `Errors.finalise` | runs `finaliser res` after the body returns | safe today, only by luck | This is the success-only finaliser used to close short-lived read handles, e.g. the legacy-file readers `read_offset_from_legacy_file` / `read_version_from_legacy_file` ([`file_manager.ml:650-672`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/file_manager.ml#L650-L672)). It does not even run the finaliser on a *synchronous* exception today (it only wraps the success path), so an asynchronous `Stack_overflow` skipping it changes nothing about the synchronous-failure case. The skipped close leaks one file descriptor, released by the OS at process exit. |
+| [`errors.ml:28-35`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L28-L35) `Errors.finalise_exn` | `try … finaliser (Some res) with exn -> finaliser None; raise exn` | safe today, only by luck → fragile | The proper clean-up bracket: it *does* run the finaliser on a synchronous exception and re-raise. An asynchronous `Stack_overflow` bypasses the `with exn ->` arm, so the finaliser is skipped. Its callers are inside the forked GC worker ([`gc_worker.ml:229`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/gc_worker.ml#L229), [`:274`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/gc_worker.ml#L274), [`:297`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/gc_worker.ml#L297)) and the GC `finalise_exn` ([`store.ml:281-297`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L281-L297)). The GC writes its result to its own files and the parent re-derives state from the control file, so a skipped finaliser there means at most a leftover temp file / fd, not store corruption. Worth converting for hygiene; not a day-one bug. |
 | [`store.ml:446-455`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L446-L455) `close` | cancels a running GC, then closes file-manager / branch / in-memory stores in sequence | safe today, only by luck | This is a plain sequence of close steps, not a bracket — if a `Stack_overflow` lands mid-sequence the later closes are skipped, leaking file descriptors. Those are released by the OS at process exit. It would matter only if a host application caught the overflow (it cannot under the new model — there is no catch site) and kept running with a half-closed repo. No on-disk effect: closing does not change the committed state. |
 | [`commit.ml:558-564`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin/commit.ml#L558-L564) `Lwt.finalize` in the lowest-common-ancestor search | finaliser only logs elapsed time | low severity (diagnostic only) | The finaliser writes a debug log line; skipping it has no resource or correctness impact. (This is also one of the deep graph walks where a `Stack_overflow` is most plausible.) |
 | [`cli.ml:627-633`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-cli/cli.ml#L620-L635) `Lwt.finalize` | closes the `.dot` output file | safe today, only by luck (CLI, one-shot) | A `Stack_overflow` while writing the `.dot` graph skips `close_out`; the file descriptor is released at process exit and the half-written file is a throwaway export. CLI command, no persistent state. |
 
 ## Why this is subtle
 
-1. **The interrupting exception fires at an arbitrary safe point.** A `Stack_overflow`
+1. **The asynchronous exception fires at an arbitrary safe point.** A `Stack_overflow`
    during a deep graph walk (history traversal, tree folding, ancestor search) surfaces
    wherever the stack happens to run out, so it can land in the middle of a write, a
    close, or a GC step. The clean-up brackets above are written defensively precisely
@@ -210,7 +209,7 @@ Lwt.catch
 
 Today, if a request triggers a `Stack_overflow`, the `| exn ->` arm catches it, logs
 it, sends the error string back to the client, and the `loop` continues serving. Under
-OxCaml the interrupting `Stack_overflow` does **not** match an ordinary `Lwt.catch` arm,
+OxCaml the asynchronous `Stack_overflow` does **not** match an ordinary `Lwt.catch` arm,
 so it bypasses the recovery entirely and **stops the server process**. Two consequences:
 
 1. The server no longer survives a stack overflow in one request — it dies instead of
@@ -222,7 +221,7 @@ so it bypasses the recovery entirely and **stops the server process**. Two conse
    keep it running, the clean-up must be fixed too.)
 
 To preserve the current behaviour, the request loop needs a `Sys.with_async_exns`
-boundary that turns the interrupting `Stack_overflow` back into an ordinary one *before*
+boundary that turns the asynchronous `Stack_overflow` back into an ordinary one *before*
 it reaches the `Lwt.catch`, placed around the per-request body so the existing `| exn ->`
 arm catches it as today. Where exactly to put it (per request, vs around the whole
 connection) is the design call.
@@ -236,17 +235,17 @@ the only `Out_of_memory` left is the synchronous kind — e.g. a bad size to `By
 
 | Site kind | Sites | Fix | Difficulty |
 |-----------|-------|-----|------------|
-| Code that catches the exception to decide what to do next — the server's recover-and-continue loop *consumes* a `Stack_overflow` to keep serving | the per-request body in `irmin-server` ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135)) | `Sys.with_async_exns` wrapper around the request body so an interrupting `Stack_overflow` is turned back into an ordinary one and the existing `Lwt.catch` `\| exn ->` arm catches it as today | design call (placement) |
+| Code that catches the exception to decide what to do next — the server's recover-and-continue loop *consumes* a `Stack_overflow` to keep serving | the per-request body in `irmin-server` ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135)) | `Sys.with_async_exns` wrapper around the request body so an asynchronous `Stack_overflow` is turned back into an ordinary one and the existing `Lwt.catch` `\| exn ->` arm catches it as today | design call (placement) |
 | Resource / state clean-up that only needs "the finaliser must run" | `Errors.finalise`/`finalise_exn` ([`errors.ml:22-35`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L22-L35)), the `batch` `on_fail` flush/flag-reset ([`store.ml:427-442`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L427-L442)), the `close` sequence ([`store.ml:446-455`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L446-L455)) | an interruption-safe clean-up helper (`new_protect`, which runs the finaliser and then re-throws the interruption unchanged) — fix the *helpers*; their callers inherit it | mechanical |
 
 `new_protect` shape: `init:(unit -> 'a) -> body:('a -> 'b) -> finaliser:('a -> unit) -> 'b`.
 
 **Caveat — how the helper re-throws.** A `new_protect` that runs the clean-up and then
-re-throws the *interrupting* exception unchanged frees the resource but keeps the
+re-throws the *asynchronous* exception unchanged frees the resource but keeps the
 exception flying past downstream ordinary handlers (you still need the explicit
 `Sys.with_async_exns` if you want the server's `Lwt.catch` to convert it to an error
 reply). A `new_protect` that instead turns it back into an *ordinary* exception would
-silently re-enable every downstream catch to swallow a future interrupting exception
+silently re-enable every downstream catch to swallow a future asynchronous exception
 against the model. So: re-throw the interruption unchanged in the helpers, and convert
 to ordinary only at the one explicit `Sys.with_async_exns` in the server loop.
 
@@ -256,7 +255,7 @@ exception between opening the handle and entering the body already leaks the han
 
 ## Resolved during this pass
 
-- **Irmin installs no interrupting-exception source of its own** — confirmed by a
+- **Irmin installs no asynchronous-exception source of its own** — confirmed by a
   tree-wide search: no `Sys.catch_break`, no `Sys.set_signal`/`Sys.signal` with a raising
   OCaml handler, no `Stdlib.Gc.finalise`, no `Memprof`, no `setitimer`/`Unix.alarm`. The
   only signal handling is the server's `Lwt_unix.on_signal` SIGINT/SIGTERM hooks
@@ -279,7 +278,7 @@ exception between opening the handle and entering the body already leaks the han
   OCaml 5.x (a program dying from runaway recursion still ran its `at_exit` callback;
   exit code 2). This matters because the GC subprocess killer is registered with
   `at_exit` ([`async.ml:43`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/async.ml#L43)):
-  even if a parent process dies of an uncaught interrupting exception, the registered
+  even if a parent process dies of an uncaught asynchronous exception, the registered
   hook kills the spawned GC child PIDs — *if OxCaml's uncaught path runs `at_exit`* (one
   runtime confirmation).
 - **The GC runs in a forked subprocess** ([`async.ml:59-77`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/async.ml#L59-L77)),
@@ -293,13 +292,13 @@ exception between opening the handle and entering the body already leaks the han
   put the wrapper.** If `irmin-server` should keep surviving a `Stack_overflow` in one
   request, it needs a `Sys.with_async_exns` boundary around the per-request body
   ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135))
-  so the interrupting `Stack_overflow` is turned back into an ordinary one and the
+  so the asynchronous `Stack_overflow` is turned back into an ordinary one and the
   existing `Lwt.catch` `| exn ->` arm catches it. This is the one real design decision.
   Coupled with it: if the server keeps running, the per-request clean-up (`batch`,
   `Errors.finalise_exn`, file handles) must also be made interruption-safe so it does not
   accumulate.
 - **OxCaml confirmation** (needs the runtime, not the source): (1) does `at_exit` run on
-  interrupting-uncaught termination, so the GC-process killer in
+  asynchronous-uncaught termination, so the GC-process killer in
   [`async.ml:43`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/async.ml#L43)
   still fires; (2) whether a `Stack_overflow` inside a `Lwt_preemptive`/threaded context
   used by a host application kills just that thread or the whole process under the new
@@ -307,7 +306,7 @@ exception between opening the handle and entering the body already leaks the han
 
 ## Checked and fine
 
-- **`Stack_overflow`** — the one realistic interrupting exception (deep graph walks).
+- **`Stack_overflow`** — the one realistic asynchronous exception (deep graph walks).
   Zero catch sites in the core library and on-disk backend, so it is already uncaught and
   fatal today and stays that way; no recovery regresses there. On its way out it skips the
   clean-up brackets in the table above, but for a one-shot program those are in-memory
@@ -362,7 +361,7 @@ exception between opening the handle and entering the body already leaks the han
 ## Recommendations
 
 In priority order. Irmin's signal discipline already matches the new model (it raises no
-interrupting exception of its own), and its error handling already lets the runtime
+asynchronous exception of its own), and its error handling already lets the runtime
 exceptions through everywhere, so the substantive work is small and confined to the
 long-lived server.
 
@@ -377,7 +376,7 @@ long-lived server.
 2. **Make the on-disk backend's clean-up helpers interruption-safe.** Reimplement
    `Errors.finalise`/`finalise_exn`
    ([`errors.ml:22-35`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L22-L35))
-   as interruption-safe `new_protect` helpers (re-throw the interrupting exception
+   as interruption-safe `new_protect` helpers (re-throw the asynchronous exception
    unchanged — do **not** turn it into an ordinary one), and similarly harden `batch`'s
    flag-reset/flush ([`store.ml:427-442`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L427-L442))
    and the `close` sequence ([`store.ml:446-455`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L446-L455)).
@@ -390,7 +389,7 @@ long-lived server.
    `Sys.Break` to handle (any Ctrl+C handling belongs to the embedding application).
 
 4. **Confirm on the OxCaml runtime** (not derivable from source): (1) `at_exit` runs on
-   interrupting-uncaught termination so the GC-process killer
+   asynchronous-uncaught termination so the GC-process killer
    ([`async.ml:43`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/async.ml#L43))
    still fires; (2) whether a `Stack_overflow` in a threaded/`Lwt_preemptive` context
    used by a host kills just that thread or the whole process.
@@ -398,16 +397,16 @@ long-lived server.
 **Sequencing note:** (1) is the only change that preserves a currently-observable
 behaviour and is the single real decision; (2) is hardening that is optional for one-shot
 use but coupled to (1) for the server; (3) is a no-op. **Do *not*** rebuild the clean-up
-helpers so they turn the interrupting exception into an ordinary one: that would re-enable
+helpers so they turn the asynchronous exception into an ordinary one: that would re-enable
 the server's downstream `| exn ->` arm (and any host catch-alls) to swallow a future
-interrupting exception, against the model — convert to ordinary only at the one explicit
+asynchronous exception, against the model — convert to ordinary only at the one explicit
 `Sys.with_async_exns` in the server loop.
 
 **A note on what is Irmin's concern vs the host's.** Irmin is a library. It produces no
-interrupting exception itself; the only one that can reach its code is `Stack_overflow`
+asynchronous exception itself; the only one that can reach its code is `Stack_overflow`
 from its own deep recursion. Whether that `Stack_overflow` is *caught* anywhere, and
 whether a Ctrl+C ever becomes a `Sys.Break`, is entirely up to the application that embeds
 Irmin. Irmin's job under the new model is narrow: keep its own clean-up brackets working
-when an interrupting exception passes through (recommendation 2), and, for the one
+when an asynchronous exception passes through (recommendation 2), and, for the one
 long-lived component it ships itself — the network server — decide whether to keep
 recovering (recommendation 1).

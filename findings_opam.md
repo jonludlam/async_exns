@@ -10,17 +10,17 @@ OxCaml's new rules for "asynchronous exceptions".
 A few kinds of event can interrupt an OCaml program at almost any moment: pressing
 Ctrl+C, a time-limit going off, or the program running out of stack space. Today they
 surface as ordinary exceptions, so a normal `try … with` catches them. OxCaml changes
-this: these interrupting exceptions now travel a separate route, an ordinary `try … with`
+this: these asynchronous exceptions now travel a separate route, an ordinary `try … with`
 no longer catches them, and unless the program wraps the right region in a new special
 handler the exception flies straight past every normal handler and either reaches that
-wrapper or stops the program. Below we call them "interrupting exceptions".
+wrapper or stops the program.
 
 ## Bottom line
 
 - **opam deliberately turns Ctrl+C into an exception.** At startup `OpamSystem.init` calls
   [`Sys.catch_break true`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L1285-L1289),
   which asks the standard library to install a `SIGINT` handler that **raises `Sys.Break`
-  from inside the signal handler**. So `Sys.Break` is a genuine interrupting exception
+  from inside the signal handler**. So `Sys.Break` is a genuine asynchronous exception
   here, and opam catches it all over the place with ordinary `try … with Sys.Break` and
   catch-all handlers.
 - **Only one exception is actually affected: `Sys.Break` (Ctrl+C).** "Out of stack"
@@ -31,7 +31,7 @@ wrapper or stops the program. Below we call them "interrupting exceptions".
   **do not raise** — they print verbose output / update a ref.
 - **Throwing side: nothing to do.** opam installs its SIGINT handler with the standard
   `Sys.catch_break true`, and OxCaml already arranges for the `Sys.Break` escaping that
-  handler to be an interrupting exception — so Ctrl+C propagates the new way with no code
+  handler to be an asynchronous exception — so Ctrl+C propagates the new way with no code
   change. (The two *ordinary* `raise Sys.Break` sites
   ([`opamSystem.ml:33`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L32-L34),
   [`opamLocal.ml:45`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/repository/opamLocal.ml#L40-L46))
@@ -41,7 +41,7 @@ wrapper or stops the program. Below we call them "interrupting exceptions".
   disk.** opam's whole install engine works by *catching the exception and turning it
   into an ordinary return value*: a raised exception becomes a `` `Exception``/`Right e`
   value at `Job.catch` / `try … with e -> Right e` points, and *that value* is what
-  drives the undo. An interrupting `Sys.Break` skips all of those catch arms, so it never
+  drives the undo. An asynchronous `Sys.Break` skips all of those catch arms, so it never
   becomes a value — it escapes the Job entirely, skipping (a) the per-package
   **roll-back** (`remove_package` of a half-installed package), (b) the parallel engine's
   killing and reaping of child processes, and (c) the apply-layer clean-up. Concretely:
@@ -92,7 +92,7 @@ wrapper or stops the program. Below we call them "interrupting exceptions".
 
 ## Which exceptions are affected
 
-### `Sys.Break` is interrupting in opam (`Sys.catch_break true`)
+### `Sys.Break` is asynchronous in opam (`Sys.catch_break true`)
 
 [`OpamSystem.init`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L1285-L1289)
 (called once at startup, documented in
@@ -100,18 +100,18 @@ wrapper or stops the program. Below we call them "interrupting exceptions".
 runs `Sys.catch_break true`. In the standard library that is
 `Sys.set_signal Sys.sigint (Signal_handle (fun _ -> raise Break))` — i.e. **opam
 installs a SIGINT handler that raises `Sys.Break` from inside the handler.** That is
-exactly the interrupting-exception pattern: today the runtime lets the raised `Sys.Break`
+exactly the asynchronous-exception pattern: today the runtime lets the raised `Sys.Break`
 surface at the next safe point, where one of opam's many `try … with Sys.Break` / `with
-_` handlers catches it. Under OxCaml it takes the interrupting path and **none** of those
+_` handlers catches it. Under OxCaml it takes the asynchronous path and **none** of those
 handlers catch it — it goes to the nearest `Sys.with_async_exns`, or it stops opam.
 
 Two consequences:
 1. **Throwing side — already handled.** Because opam uses the standard
    `Sys.catch_break true`, OxCaml already makes the `Sys.Break` escaping that handler an
-   interrupting exception. opam needs no code change to throw it the new way; Ctrl+C
-   propagates correctly as an interrupting `Sys.Break`.
+   asynchronous exception. opam needs no code change to throw it the new way; Ctrl+C
+   propagates correctly as an asynchronous `Sys.Break`.
 2. **Catching side — the work.** Every `with Sys.Break` / catch-all handler stops firing;
-   a `Sys.with_async_exns` wrapper is needed to turn the interrupting exception back into
+   a `Sys.with_async_exns` wrapper is needed to turn the asynchronous exception back into
    an ordinary one. This is where opam needs changes.
 
 (`Sys.Break` is *also* raised the ordinary way from a child's exit status —
@@ -139,7 +139,7 @@ around as values** (`` `Successful``/`` `Exception e``/`` `Error (`Aborted …)`
   [`opamSolution.ml:810-819`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamSolution.ml#L810-L819)
   `with Parallel.Errors … -> … | e -> `Exception e`.
 
-An interrupting `Sys.Break` skips *every one of these arms*, so it is never turned into a
+An asynchronous `Sys.Break` skips *every one of these arms*, so it is never turned into a
 value: the per-package roll-back
 ([`opamAction.ml:1128-1132`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamAction.ml#L1128-L1132)
 `remove_package` of the half-install), the engine's child reaping, and the
@@ -157,7 +157,7 @@ it.
   ([`opamRepositoryState.ml:334`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamRepositoryState.ml#L334)),
   and json/flush
   ([`opamCliMain.ml:491-494`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamCliMain.ml#L491-L494)).
-  These survive interrupting-uncaught termination *as long as OxCaml's uncaught path runs
+  These survive asynchronous-uncaught termination *as long as OxCaml's uncaught path runs
   `at_exit`* (one thing to confirm on the runtime).
 - **Not** backstopped: the temp dirs from `OpamSystem.with_tmp_dir` /
   `OpamFilename.with_tmp_dir` (not in `at_exit`), half-installed switch prefixes, and
@@ -170,16 +170,16 @@ it.
 ## Clean-up that could be skipped
 
 All the sites below do clean-up or roll-back via an
-`Exn.finalise`/`Exn.finally`/`Job.*`/`Fun.protect`/`with e ->` arm that an interrupting
+`Exn.finalise`/`Exn.finally`/`Job.*`/`Fun.protect`/`with e ->` arm that an asynchronous
 `Sys.Break` bypasses. Verdicts assume a one-shot command (opam has no long-running mode).
 
 | Site | Cleanup | Verdict | Why |
 |------|---------|---------|-----|
-| [`opamAction.ml:1062-1066`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamAction.ml#L1062-L1066) + [`:1128-1132`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamAction.ml#L1128-L1132) install + rollback | `try process_dot_install () with e -> Right e`, then `Right e → remove_package` rollback | **GENUINE BUG** | An interrupting `Sys.Break` after files are copied into the switch prefix but before the install finishes skips the `with e -> Right e` step, so the `remove_package` roll-back never runs. Orphan files stay in the switch prefix while the package is *not* in `switch-state`. Every later opam command sees the mismatch. On disk; not "exiting anyway". |
+| [`opamAction.ml:1062-1066`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamAction.ml#L1062-L1066) + [`:1128-1132`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamAction.ml#L1128-L1132) install + rollback | `try process_dot_install () with e -> Right e`, then `Right e → remove_package` rollback | **GENUINE BUG** | An asynchronous `Sys.Break` after files are copied into the switch prefix but before the install finishes skips the `with e -> Right e` step, so the `remove_package` roll-back never runs. Orphan files stay in the switch prefix while the package is *not* in `switch-state`. Every later opam command sees the mismatch. On disk; not "exiting anyway". |
 | [`opamConsole.ml:756-767`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamConsole.ml#L756-L767) menu/password prompt | `Exn.finally reset` (tcsetattr restore) + `with Sys.Break -> …` | **GENUINE BUG** | Ctrl+C at an interactive prompt bypasses the `Exn.finally` *and* the `with Sys.Break` arm, leaving the terminal in raw mode (echo and canonical mode off) after opam dies. Visible to the user (broken shell); no `at_exit` restore. |
-| [`opamProcess.ml:763-768`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.ml#L763-L768) `run` + [`opamParallel.ml:202-239`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamParallel.ml#L202-L239) `fail` | `with e -> interrupt p; raise e` / reap siblings | low severity | An interrupting `Sys.Break` skips `interrupt p`, so the running build/compiler child is not killed and is reparented to init when opam exits. A temporary orphan process, not on-disk mess. (The "be careful to handle `Sys.Break`" warning at [`opamProcess.mli:109-111`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.mli#L109-L111) is exactly this.) |
-| [`opamSwitchState.ml:1383-1394`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamSwitchState.ml#L1383-L1394) `with_` (+ [`opamGlobalState.ml:200-203`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamGlobalState.ml#L200-L203)) | `with e -> finalise e (drop st)` — `funlock` + `cleanup_backup false` | safe today, but only by luck (low) | `drop` releases the OS file-descriptor lock (auto-released at process exit anyway) and runs `cleanup_backup false`. The backup snapshot is *written at the start* ([`do_backup`, opamSwitchState.ml:1353-1357](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamSwitchState.ml#L1353-L1381)); the skipped `cleanup_backup true` would have *deleted* it, so on an interrupting Break the recovery snapshot is **kept**, not lost. Only the "restore with `opam switch import …`" *message* is skipped (diagnostic). |
-| [`opamSystem.ml:406-415`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L406-L415) `with_tmp_dir` / [`opamFilename.ml:70`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamFilename.ml#L70) | `try … remove_dir dir … with e -> finalise e (remove_dir dir)` | safe today, but only by luck → fragile | The temp dir is not in `at_exit`, so an interrupting Break leaves it on disk. But build dirs are cleared at the start of the next build ([`opamSolution.ml:651-652`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamSolution.ml#L646-L654) `rmdir dir`), and other temp dirs land under `~/.opam/.../log`, which `logs_cleaner` cleans at `at_exit`. Wasted disk space at worst; no broken invariant. |
+| [`opamProcess.ml:763-768`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.ml#L763-L768) `run` + [`opamParallel.ml:202-239`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamParallel.ml#L202-L239) `fail` | `with e -> interrupt p; raise e` / reap siblings | low severity | An asynchronous `Sys.Break` skips `interrupt p`, so the running build/compiler child is not killed and is reparented to init when opam exits. A temporary orphan process, not on-disk mess. (The "be careful to handle `Sys.Break`" warning at [`opamProcess.mli:109-111`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.mli#L109-L111) is exactly this.) |
+| [`opamSwitchState.ml:1383-1394`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamSwitchState.ml#L1383-L1394) `with_` (+ [`opamGlobalState.ml:200-203`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamGlobalState.ml#L200-L203)) | `with e -> finalise e (drop st)` — `funlock` + `cleanup_backup false` | safe today, but only by luck (low) | `drop` releases the OS file-descriptor lock (auto-released at process exit anyway) and runs `cleanup_backup false`. The backup snapshot is *written at the start* ([`do_backup`, opamSwitchState.ml:1353-1357](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamSwitchState.ml#L1353-L1381)); the skipped `cleanup_backup true` would have *deleted* it, so on an asynchronous Break the recovery snapshot is **kept**, not lost. Only the "restore with `opam switch import …`" *message* is skipped (diagnostic). |
+| [`opamSystem.ml:406-415`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L406-L415) `with_tmp_dir` / [`opamFilename.ml:70`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamFilename.ml#L70) | `try … remove_dir dir … with e -> finalise e (remove_dir dir)` | safe today, but only by luck → fragile | The temp dir is not in `at_exit`, so an asynchronous Break leaves it on disk. But build dirs are cleared at the start of the next build ([`opamSolution.ml:651-652`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamSolution.ml#L646-L654) `rmdir dir`), and other temp dirs land under `~/.opam/.../log`, which `logs_cleaner` cleans at `at_exit`. Wasted disk space at worst; no broken invariant. |
 | [`opamFilename.ml:478-527`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamFilename.ml#L478-L527) `with_flock` / `with_flock_upgrade` / `with_flock_write_then_read` | `with e -> finalise e (funlock …)` | safe today, but only by luck | A skipped `funlock` leaks an OS file-descriptor lock that the kernel releases at process exit. No stale on-disk lock for the next command. Would become a real in-process deadlock only in a (non-existent) long-running mode. |
 | `OpamStd.Exn.finally`/`finalise` ([`opamStd.ml:1625-1633`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamStd.ml#L1625-L1634)); `Job.finally`/`Job.catch` ([`opamProcess.ml:920-939`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.ml#L920-L939)); 5× `Fun.protect` ([`opamSystem.ml:388`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L388), [`opamConfigCommand.ml:176`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamConfigCommand.ml#L176), [`opamRepositoryState.ml:142`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamRepositoryState.ml#L142)/[`:220`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/state/opamRepositoryState.ml#L220), [`opamPatch.ml:406`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamPatch.ml#L406)) | the **helpers** underlying all the above | fragile (fix here) | These are the leverage points: ~11 `Exn.finally` + 21 `Exn.finalise` + 5 `Job.finally` callers + 20 `Job.catch` callers. Rebuilding the helpers as interruption-safe versions fixes every caller, including external library users (`opam-core`/`opam-state`/`opam-client` are public). |
 
@@ -230,7 +230,7 @@ The fixes split by *what each site needs from the exception*:
 | Resource / state / lock clean-up — only needs "the finaliser must run" | `Exn.finally`/`finalise` ([`opamStd.ml:1625`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamStd.ml#L1625-L1634)), `Job.finally` ([`opamProcess.ml:934`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.ml#L934-L939)), `with_tmp_dir`, `with_flock`, `with_` state wrappers, terminal `reset` ([`opamConsole.ml:757`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamConsole.ml#L756-L765)), 5× `Fun.protect` | `new_protect` — fix the *helpers*; callers inherit it | mechanical, ~4 definitions |
 | Catches the exception to decide what to do next — *consumes* the Break to make a control-flow / roll-back decision | `Job.catch` ([`opamProcess.ml:920`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.ml#L920-L925)), `opamAction.ml:1066` install rollback, `opamParallel.ml fail`, `opamSolution.ml:819`, `main_catch_all` | `Sys.with_async_exns` wrapper (placement = design call) | design call (where to put the wrapper) |
 
-**Caveat — how the helper re-throws.** A `new_protect` that re-throws the *interrupting*
+**Caveat — how the helper re-throws.** A `new_protect` that re-throws the *asynchronous*
 exception frees the resource but keeps the Break flying past downstream normal handlers
 (you still need an explicit `with_async_exns` for the graceful-Ctrl+C result). A version
 that re-throws an *ordinary* exception instead would silently re-enable opam's many
@@ -246,19 +246,19 @@ already leaks the lock today.
 
 ## Resolved during this pass
 
-- **`Sys.Break` really is interrupting in opam** — confirmed via `Sys.catch_break true`
+- **`Sys.Break` really is asynchronous in opam** — confirmed via `Sys.catch_break true`
   ([`opamSystem.ml:1287`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L1285-L1289)),
   which installs a SIGINT handler that raises. This is the single most important fact
   about opam for this analysis.
 - **Throwing side needs no change** — OxCaml already makes the `Sys.Break` raised by the
-  standard `Sys.catch_break` an interrupting exception. So opam does not need to install
+  standard `Sys.catch_break` an asynchronous exception. So opam does not need to install
   its own SIGINT handler or call any "throw it the new way" primitive; Ctrl+C already
   propagates correctly. All remaining work is on the catching side. (This makes the
   roll-back bug below a *present-day* bug on OxCaml, not merely a future risk: the
-  interrupting `Sys.Break` is delivered today and already skips the catch-and-undo arms.)
+  asynchronous `Sys.Break` is delivered today and already skips the catch-and-undo arms.)
 - **`at_exit` runs when `Sys.Break` is uncaught** — verified by experiment on stock OCaml
   5.x (the `at_exit` callback fired; exit code 2). So `logs_cleaner`, repo-state cleanup
-  and json/flush survive interrupting-uncaught termination *if OxCaml's path matches* (one
+  and json/flush survive asynchronous-uncaught termination *if OxCaml's path matches* (one
   thing to confirm). Half-installs / temp dirs / terminal state are **not** in `at_exit`.
 - **flock locks are auto-released at process exit** — they are `Unix.lockf` advisory
   locks on file descriptors
@@ -271,7 +271,7 @@ already leaks the lock today.
   live `try…with` at the apply layer. State is flushed *between* actions
   ([`opamSolution.ml:353-354` comment + `add_to_install`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamSolution.ml#L353-L377)),
   so a Break *between* actions is safe; the bug window is a Break *inside* an action.
-- **The switch-state backup is kept, not lost, on an interrupting Break** — `do_backup`
+- **The switch-state backup is kept, not lost, on an asynchronous Break** — `do_backup`
   writes it up front; only the success-path *delete* is skipped.
 - **No daemon/server/watch/REPL mode** — opam is a one-shot command; the long-running-mode
   exemption does not apply (so on-disk effects matter, in-memory ones don't).
@@ -292,14 +292,14 @@ already leaks the lock today.
     → roll-back + child reaping + state-save run as today. This preserves opam's current
     graceful-interrupt behaviour and is the recommended placement.
 - **OxCaml confirmation** (needs the runtime, not the source): does `at_exit` run on
-  interrupting-uncaught termination (so `logs_cleaner`/repo-cleanup/flush survive)?
+  asynchronous-uncaught termination (so `logs_cleaner`/repo-cleanup/flush survive)?
   (The throwing-side question is *settled*: `Sys.catch_break` already yields an
-  interrupting `Sys.Break` on OxCaml, so opam's SIGINT path needs no change — see
+  asynchronous `Sys.Break` on OxCaml, so opam's SIGINT path needs no change — see
   "Resolved during this pass".)
 
 ## Checked and fine
 
-- **`Stack_overflow`** — listed as interrupting by the doc; opam is recursive (graphs,
+- **`Stack_overflow`** — listed as asynchronous by the doc; opam is recursive (graphs,
   solver), but has **zero** catch sites. Uncaught and fatal today; stays fatal. On its way
   out it does skip the same clean-up helpers (the ones that only clean up and re-throw) —
   same "safe today, only by luck" analysis as `Sys.Break`, minus any recovery path.
@@ -320,7 +320,7 @@ already leaks the lock today.
 - **Lock-wait `Sys.Break` re-raise**
   ([`opamSystem.ml:1170-1175`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamSystem.ml#L1170-L1175))
   — `with Sys.Break as e -> errmsg "\n"; raise e` while waiting on a contended lock.
-  Diagnostic-only (prints a newline) then re-throws; an interrupting Break that skips it
+  Diagnostic-only (prints a newline) then re-throws; an asynchronous Break that skips it
   just omits the newline. Low severity — this is code that catches the exception only to
   print before re-throwing.
 - **`display_error` / `parallel_apply` `` `Exception `` matches**
@@ -337,7 +337,7 @@ already leaks the lock today.
 ## Recommendations
 
 In priority order. The throwing side already works (`Sys.catch_break` gives an
-interrupting `Sys.Break` on OxCaml), so all the work is on the catching side.
+asynchronous `Sys.Break` on OxCaml), so all the work is on the catching side.
 
 1. **Choose where to put the `Sys.with_async_exns` wrapper — the one real design call.**
    Recommended: **per package action**, around `command`/`cont` in the
@@ -356,7 +356,7 @@ interrupting `Sys.Break` on OxCaml), so all the work is on the catching side.
    ([`opamStd.ml:1625-1633`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamStd.ml#L1625-L1634))
    and `OpamProcess.Job.finally`/`Job.catch`
    ([`opamProcess.ml:920-939`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/core/opamProcess.ml#L920-L939))
-   as interruption-safe `new_protect` helpers (re-throw the *interrupting* exception, do
+   as interruption-safe `new_protect` helpers (re-throw the *asynchronous* exception, do
    **not** turn it into an ordinary one). This fixes `with_tmp_dir`,
    `with_flock`/`with_flock_*`, the `with_` state wrappers, and all `Fun.protect` callers
    (including external library users) at once.
@@ -364,7 +364,7 @@ interrupting `Sys.Break` on OxCaml), so all the work is on the catching side.
 3. **Fix the two genuine on-disk bugs explicitly** (independent; can land first):
    - Half-install roll-back
      ([`opamAction.ml:1062-1132`](https://github.com/ocaml/opam/blob/be8d399c36cc24ad3adfb90a8189af9a9bbad747/src/client/opamAction.ml#L1062-L1132)):
-     make sure `remove_package` runs even on an interrupting Break (covered by the
+     make sure `remove_package` runs even on an asynchronous Break (covered by the
      per-action wrapper from (1), or wrap the install body in `new_protect` that rolls
      back).
    - Terminal restore
@@ -373,12 +373,12 @@ interrupting `Sys.Break` on OxCaml), so all the work is on the catching side.
      Ctrl+C at a prompt (and/or register a tcsetattr restore in `at_exit`).
 
 4. **Confirm on the OxCaml runtime** (not derivable from source): does `at_exit` run on
-   interrupting-uncaught termination (so `logs_cleaner`/repo-cleanup/flush survive)?
+   asynchronous-uncaught termination (so `logs_cleaner`/repo-cleanup/flush survive)?
 
 **Sequencing note:** the throwing side needs no work (`Sys.catch_break` already yields an
-interrupting `Sys.Break`), so (1) the wrapper placement can land on its own and restores
+asynchronous `Sys.Break`), so (1) the wrapper placement can land on its own and restores
 today's graceful-interrupt behaviour. (2) is independent and the bulk of the leverage.
 (3) is the concrete user-visible payoff and is largely covered by (1)+(2). **Do *not***
-rebuild the helpers so they turn the interrupting exception into an ordinary one: opam has
+rebuild the helpers so they turn the asynchronous exception into an ordinary one: opam has
 dozens of downstream `with Sys.Break`/`with _` arms that would then silently re-enable
 Ctrl+C swallowing — defeating the model.
