@@ -33,6 +33,15 @@ And a key judgement call throughout: a skipped clean-up is only an *actual* bug 
 something later notices the mess. Many suspicious-looking spots turn out to be harmless
 today — but often only by luck, so they are still worth tidying.
 
+**Empirical validation.** The model above was checked on a real OxCaml switch (`5.2.0+ox`)
+against stock OCaml, not just read from the design doc — see `experiments/RESULTS.md`. The
+experiments confirm: Ctrl+C and stack-overflow are indeed asynchronous on OxCaml (an ordinary
+`try … with` no longer catches them; the new wrapper does), Ctrl+C is asynchronous whether
+raised by the standard mechanism or a program's own handler, and — the sharpest new result — a
+program's *own custom* exception raised from a signal handler or finaliser simply **terminates
+the process** and the wrapper cannot rescue it (only Ctrl+C and stack-overflow can be). That
+last point is what reshapes the Alt-Ergo and utop fixes below.
+
 ---
 
 ## Alt-Ergo (an automated theorem prover) — one real bug; tricky to place the wrapper
@@ -44,9 +53,15 @@ throws a `Timeout` exception — exactly the kind of exception that changes beha
 single `Timeout` is the only thing affected here: Ctrl+C just exits immediately, and
 nothing else (out-of-stack, out-of-memory, finalisers) is relevant.
 
-So two things are needed: the timer must throw `Timeout` the new way, and the many places
-deep inside the solver that catch `Timeout` (to report "timed out / unknown" and carry
-on) must be wrapped so they keep working.
+So two things are needed: the timer must deliver its interruption the new way, and the many
+places deep inside the solver that catch `Timeout` (to report "timed out / unknown" and carry
+on) must be wrapped so they keep working. **An experiment on the actual OxCaml switch
+sharpened the first half** (see `experiments/RESULTS.md`): a *custom* exception like
+`Timeout`, raised from a signal handler, simply **terminates the program** on that switch, and
+the new wrapper cannot rescue it — only Ctrl+C and stack-overflow can be delivered that way.
+So Alt-Ergo's timeout, as written, does not just "need updating" — it has to be restructured
+(e.g. have the timer raise the Ctrl+C exception instead, or make the timeout cooperative). A
+future OxCaml with a dedicated "raise asynchronously" primitive would give a cleaner option.
 
 **One genuine bug.** A helper temporarily switches off the "step limit", does some work,
 then switches it back on. If a timeout strikes during that work, the "switch back on" is
@@ -169,7 +184,9 @@ The fix is small. Wrap the evaluation step in the new wrapper (which turns the i
 back into an ordinary exception), placed inside the loop below the existing catch-all, so
 the interruption is reported and the loop continues exactly as today; where to put it is the
 only real design call. Separately, utop's own SIGHUP/SIGTERM handler raises a custom `Term`
-exception and must throw it the new way (or simply be dropped). A few save/restore sites
+exception; the experiment (see `experiments/RESULTS.md`) shows a custom exception from a
+signal handler just terminates the process on the OxCaml switch and the wrapper can't catch
+it, so `Term` should simply be dropped (it is never caught by name anyway). A few save/restore sites
 (formatter state, a temp file) are safe today only by luck and should move to the
 interruption-safe helper once recovery is restored. Everything else checked is clear.
 
@@ -294,7 +311,7 @@ cancellation; both are fine.
 
 ---
 
-## Irmin (the Git-like store) — safe today; one real change in the network server
+## Irmin (the Git-like store) — safe today; no confirmed day-one bug
 
 Detailed write-up: `findings/irmin.md`.
 
@@ -309,11 +326,17 @@ but none is a live bug: the skipped work is in-memory flags and file descriptors
 system reclaims, and the on-disk store cannot be corrupted because it commits by writing data
 and then atomically renaming a small control file — a skipped flush mid-write is no worse than
 a power loss, which the format already tolerates. These are worth moving to the
-interruption-safe helper for hygiene. The one place behaviour actually changes is the
-long-lived network server (`irmin-server`): its per-request loop catches any exception and
-keeps serving, but under the new rules a stack overflow flies past that catch and stops the
-whole server. Keeping recover-and-continue needs the new wrapper around each request (placement
-is the open design call). Everything else is clear or low-severity.
+interruption-safe helper for hygiene.
+
+A first draft of this analysis flagged the long-lived network server (`irmin-server`) as a
+genuine change — its per-request loop catches exceptions and keeps serving, so a stack
+overflow would seem to stop it under the new rules. **Verification corrected this.** Whether
+that loop catches a stack overflow at all depends on Lwt's exception filter, and on the Lwt
+we checked the default *excludes* stack overflow — so the server already does not recover
+from a stack-overflowing request today, and the new rules change nothing. It would only be a
+real change on a Lwt configured to catch stack overflow (an older Lwt, or a host that opts
+in). So there is no confirmed day-one bug; the server case is version-dependent and should be
+checked against the exact Lwt in use. Everything else is clear or low-severity.
 
 ---
 
@@ -360,7 +383,7 @@ risk for interrupts that land mid-reduction; the re-raise should preserve the as
 
 ---
 
-## Frama-C (the C analysis platform) — minor and mode-dependent: no batch bug, two real server-mode bugs
+## Frama-C (the C analysis platform) — minor; no confirmed day-one bug (a latent server-mode hazard)
 
 Detailed write-up: `findings/frama-c.md`.
 
@@ -373,21 +396,21 @@ handler). Its general cancellation and the prover timeout are not signal-driven 
 a flag and raise at explicit check-points — so they keep working unchanged. There are no
 finalisers, and nothing catches running out of stack.
 
-In one-shot batch mode there is no real bug: the process is exiting, and the exit handler still
-runs (verified), so prover temp files are deleted, child provers killed, and output flushed. The
-only losses are cosmetic (Eva's "save partial results on Ctrl+C" feature, the clean exit code) and
-are restored by placing the wrapper correctly. The genuine bugs appear in the long-lived server
-mode, which recovers from an interrupt and keeps serving: two kernel-wide restore helpers — one
-that restores which "project" is current, one that resets a "has this run?" flag — restore
-long-lived global state through a clean-up handler that an asynchronous Ctrl+C skips. Skipping them
-leaves the wrong project current for every later request, and makes the Eva analysis believe it has
-already run, so it silently returns nothing.
+In one-shot batch mode there is no bug: the process is exiting, and the exit handler still runs
+(verified), so prover temp files are deleted, child provers killed, and output flushed; the only
+losses are cosmetic (Eva's "save partial results on Ctrl+C" feature, the clean exit code).
 
-The fix is to rebuild those two restore helpers on the interruption-safe bracket (which fixes all
-their callers at once) and to add the new wrapper where interruptions are caught to decide what to
-do next — one high wrapper in batch mode, and one per request in the server so a Ctrl+C becomes an
-ordinary exception the existing handlers catch and the restores below it still run. (The
-interactive GUI ships as a separate package and is worth its own pass.)
+A first draft flagged two "genuine server-mode bugs" — two kernel-wide restore helpers (one
+restores which "project" is current, one resets a "has this run?" flag) whose clean-up an
+asynchronous Ctrl+C would skip, supposedly leaving the wrong project current / Eva believing it
+already ran for every later request. **Verification corrected this.** The premise was false: in
+`-server` mode Ctrl+C is the *shutdown* path — the server's only `Sys.Break` handling is a
+main-loop guard that leaves the loop, and it re-raises and terminates. So the server does not keep
+serving after a Ctrl+C in either the current or the new model, and the corrupted globals are never
+observed. The skipped restores are therefore a *latent* hazard, not a day-one bug: they would only
+bite if someone later added a per-request wrapper that let the server survive Ctrl+C — in which
+case the restores must be made interruption-safe at the same time. (The interactive GUI ships as a
+separate package and is worth its own pass.)
 
 ---
 

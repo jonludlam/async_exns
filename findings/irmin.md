@@ -61,15 +61,19 @@ and either reaches that wrapper or stops the program.
   ([`store.ml:404-444`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L404-L444)).
   These are the high-leverage points to harden (details below), but none is a
   day-one on-disk bug for a one-shot program.
-- **The one genuine behaviour change is in the long-lived network server
-  (`irmin-server`).** Its per-request loop catches any exception with a wildcard
-  `Lwt.catch` arm, logs it, replies with an error, and keeps serving the next request
+- **The long-lived network server (`irmin-server`) is *not* a confirmed day-one change —
+  it depends on Lwt's exception filter, and on current Lwt there is no change.** Its
+  per-request loop wraps each request in `Lwt.catch` and would, in principle, recover from
+  a failed request and keep serving
   ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135)).
-  Today a `Stack_overflow` during one request is caught there and the server recovers.
-  Under OxCaml the asynchronous `Stack_overflow` bypasses that `Lwt.catch` and **stops
-  the server process** instead of recovering. This is the only place Irmin's current
-  behaviour visibly changes, and it needs a `Sys.with_async_exns` wrapper if the
-  recover-and-continue behaviour is to be kept.
+  But `Lwt.catch` only catches an exception that passes Lwt's `Exception_filter`, and the
+  **default filter (`handle_all_except_runtime`, verified in the Lwt source) excludes
+  `Stack_overflow`** — so on current Lwt the server **already does not recover** from a
+  stack-overflowing request, and the new model changes nothing. It would only be a genuine
+  change on a Lwt whose default filter catches `Stack_overflow` (older Lwt, or a host that
+  sets `handle_all`). Confirm `irmin-server`'s pinned Lwt before treating this as real
+  (see "The network server" below). Either way the per-request clean-up is fragile and
+  worth hardening.
 - **Everything else checked** (`Out_of_memory`, the store's own `Gc` module — which is
   not OCaml's `Gc.finalise`, the `Lwt_unix.on_signal` handlers in the server, the
   `Lwt.finalize` sites in the core and CLI, the `at_exit` GC-process killer, the
@@ -191,7 +195,7 @@ is treated separately below.
    server, which *catches and recovers* today, the same skipped clean-up accumulates
    across the process lifetime — and the recovery itself stops happening (see below).
 
-## The one genuine behaviour change: the network server's recover-and-continue loop
+## The network server: version-dependent, and *not* a day-one change on current Lwt
 
 `irmin-server` runs a per-connection request loop that wraps each request in
 `Lwt.catch` with a final wildcard arm
@@ -207,18 +211,36 @@ Lwt.catch
 >>= fun () -> loop repo conn client info
 ```
 
-Today, if a request triggers a `Stack_overflow`, the `| exn ->` arm catches it, logs
-it, sends the error string back to the client, and the `loop` continues serving. Under
-OxCaml the asynchronous `Stack_overflow` does **not** match an ordinary `Lwt.catch` arm,
-so it bypasses the recovery entirely and **stops the server process**. Two consequences:
+It is tempting to say "today a `Stack_overflow` in a request is caught here and the
+server keeps serving, and under OxCaml it would bypass the arm and stop the server."
+**But whether `Lwt.catch` catches a `Stack_overflow` at all depends on Lwt's exception
+filter, and on current Lwt it does not** — so there is most likely no day-one change to
+preserve here:
 
-1. The server no longer survives a stack overflow in one request — it dies instead of
-   recovering. That is a real, silent behaviour change for the daemon.
-2. Because the recovery is skipped, the in-flight `batch`/`with_lock`/file-handle
-   clean-up for that request is also skipped, and (unlike the one-shot case) the process
-   does not exit to reclaim it — it would accumulate across the server's lifetime if the
-   server *did* keep running. (It will not, given point 1, but if a wrapper is added to
-   keep it running, the clean-up must be fixed too.)
+> **What Lwt's filter actually does.** Lwt's `catch`/`try_bind`/`finalize` only catch an
+> exception that passes `Lwt.Exception_filter.run`. Reading the Lwt source we have checked
+> out (`lwt/src/core/lwt.ml`), the **default filter is `handle_all_except_runtime`, which
+> returns `false` for `Stack_overflow` and `Out_of_memory`** (`let v = ref
+> handle_all_except_runtime`). (The `lwt.mli` doc comment that calls `handle_all` the
+> default is stale — the code says otherwise.) `irmin-server` never calls
+> `Lwt.Exception_filter.set`, so on this Lwt its `| exn ->` arm **already does not catch a
+> `Stack_overflow`** — the server already does not recover from a stack-overflowing
+> request today, so the new model changes nothing about that.
+
+So the verdict here is **version-dependent and must be confirmed against the actual Lwt
+`irmin-server` is built against**:
+- On Lwt with the `handle_all_except_runtime` default (what we verified): the per-request
+  `Lwt.catch` does not catch `Stack_overflow` today, the server already dies on such a
+  request, and there is **no day-one behaviour change** — the skipped clean-up is then in
+  the same "safe today only by luck / fragile" category as the rest.
+- Only on a Lwt whose default filter catches `Stack_overflow` (an older Lwt predating the
+  exception filter, or a host that calls `Lwt.Exception_filter.set handle_all`) would the
+  server recover today and lose that recovery under OxCaml — and then the skipped
+  per-request clean-up would also accumulate across the server's lifetime.
+
+This is exactly the kind of cross-dependency assumption to verify rather than assert: the
+"genuine server bug" only exists for a Lwt configuration that, by default, current Lwt is
+not. Confirm `irmin-server`'s pinned Lwt and its filter before treating this as real.
 
 To preserve the current behaviour, the request loop needs a `Sys.with_async_exns`
 boundary that turns the asynchronous `Stack_overflow` back into an ordinary one *before*
@@ -235,7 +257,7 @@ the only `Out_of_memory` left is the synchronous kind — e.g. a bad size to `By
 
 | Site kind | Sites | Fix | Difficulty |
 |-----------|-------|-----|------------|
-| Code that catches the exception to decide what to do next — the server's recover-and-continue loop *consumes* a `Stack_overflow` to keep serving | the per-request body in `irmin-server` ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135)) | `Sys.with_async_exns` wrapper around the request body so an asynchronous `Stack_overflow` is turned back into an ordinary one and the existing `Lwt.catch` `\| exn ->` arm catches it as today | design call (placement) |
+| Server's per-request loop — *only if* it recovers from `Stack_overflow` today, which on current Lwt it does **not** (the default filter excludes `Stack_overflow`); applies only on a Lwt that catches it | the per-request body in `irmin-server` ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135)) | *if* recovery is wanted and the Lwt filter catches `Stack_overflow`: a `Sys.with_async_exns` wrapper around the request body so the existing `Lwt.catch` `\| exn ->` arm catches it as today | conditional — verify the Lwt filter first |
 | Resource / state clean-up that only needs "the finaliser must run" | `Errors.finalise`/`finalise_exn` ([`errors.ml:22-35`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/errors.ml#L22-L35)), the `batch` `on_fail` flush/flag-reset ([`store.ml:427-442`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L427-L442)), the `close` sequence ([`store.ml:446-455`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/store.ml#L446-L455)) | an interruption-safe clean-up helper (`new_protect`, which runs the finaliser and then re-throws the interruption unchanged) — fix the *helpers*; their callers inherit it | mechanical |
 
 `new_protect` shape: `init:(unit -> 'a) -> body:('a -> 'b) -> finaliser:('a -> unit) -> 'b`.
@@ -297,6 +319,18 @@ exception between opening the handle and entering the body already leaks the han
   Coupled with it: if the server keeps running, the per-request clean-up (`batch`,
   `Errors.finalise_exn`, file handles) must also be made interruption-safe so it does not
   accumulate.
+- **Dependency on Lwt's exception filter — verify against the pinned Lwt.** Whether the
+  server recovers from a `Stack_overflow` today (and therefore whether there is any change
+  to preserve) hinges entirely on Lwt's `Exception_filter`. In the Lwt source we checked
+  out (`lwt/src/core/lwt.ml`) the **default is `handle_all_except_runtime`, which excludes
+  `Stack_overflow`/`Out_of_memory`** — so on that Lwt `Lwt.catch` does **not** catch a
+  stack overflow, the server already dies on such a request, and there is **no day-one
+  change** (recommendation 1 is moot). The server would only have recover-and-continue
+  behaviour to lose on a Lwt whose default catches `Stack_overflow` — an older Lwt
+  predating the filter, or a host that calls `Lwt.Exception_filter.set handle_all`. Action:
+  check the exact Lwt `irmin-server` is built against and its filter setting before
+  treating the server case as a real change. (Note: an earlier draft of this report
+  asserted the default was `handle_all`; that was wrong — corrected against the source.)
 - **OxCaml confirmation** (needs the runtime, not the source): (1) does `at_exit` run on
   asynchronous-uncaught termination, so the GC-process killer in
   [`async.ml:43`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-pack/unix/async.ml#L43)
@@ -362,16 +396,20 @@ exception between opening the handle and entering the body already leaks the han
 
 In priority order. Irmin's signal discipline already matches the new model (it raises no
 asynchronous exception of its own), and its error handling already lets the runtime
-exceptions through everywhere, so the substantive work is small and confined to the
-long-lived server.
+exceptions through everywhere, so there is no confirmed day-one change and the substantive
+work is small.
 
-1. **Decide whether to preserve the network server's recover-and-continue behaviour, and
-   place a `Sys.with_async_exns` wrapper accordingly.** This is the only place Irmin's
-   current observable behaviour changes under OxCaml. If the daemon should keep surviving a
-   `Stack_overflow` in one request, wrap the per-request body
+1. **First, settle whether the network server even has behaviour to preserve — verify its
+   Lwt's exception filter.** On the Lwt we checked (default `handle_all_except_runtime`,
+   which excludes `Stack_overflow`), `irmin-server`'s per-request `Lwt.catch`
    ([`server.ml:99-135`](https://github.com/mirage/irmin/blob/7a09a06fff67bc4981faca36a332c51fc16e819e/src/irmin-server/unix/server.ml#L99-L135))
-   in `Sys.with_async_exns` so the existing `Lwt.catch` `| exn ->` arm catches it as
-   today. This is the design call.
+   **already does not recover** from a stack-overflowing request, so there is nothing to
+   preserve and no wrapper is needed. *Only if* `irmin-server` is built against a Lwt whose
+   default catches `Stack_overflow` (or a host sets `handle_all`) does it recover today —
+   in which case decide whether to keep that, and if so wrap the per-request body in
+   `Sys.with_async_exns` so the existing `| exn ->` arm catches it as today (and make the
+   per-request clean-up in (2) interruption-safe so it doesn't accumulate). This is the
+   design call, gated on the filter check.
 
 2. **Make the on-disk backend's clean-up helpers interruption-safe.** Reimplement
    `Errors.finalise`/`finalise_exn`

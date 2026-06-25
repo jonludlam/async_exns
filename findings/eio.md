@@ -22,9 +22,11 @@ handler and either reaches that wrapper or stops the program.
 - **Eio already does the thing the new model wants for signals.** The one OCaml
   signal handler Eio installs in its own library code is the SIGCHLD handler in
   [`process.ml:168-169`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio/unix/process.ml#L168-L169),
-  and its whole body is `Eio.Condition.broadcast sigchld`. `broadcast` is documented
-  as the one operation that is safe to call from a signal handler
-  ([`condition.mli:82-85`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio/condition.mli#L82-L85),
+  and its whole body is `Eio.Condition.broadcast sigchld`. `broadcast` calls
+  `Broadcast.resume_all`, which is documented as "lock-free and can be used safely even
+  from a signal handler or GC finalizer"
+  ([`broadcast.mli:24-28`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio/core/broadcast.mli#L24-L28);
+  the callbacks it runs "must not raise", [`broadcast.mli:13-22`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio/core/broadcast.mli#L13-L22)),
   and the warning comment in
   [`examples/signals/main.ml:21-26`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/examples/signals/main.ml#L21-L26)):
   it only appends already-waiting fibers to the run queue and writes one wake-up byte
@@ -110,8 +112,13 @@ There is exactly one OCaml signal handler in Eio's own library code:
   lock-free run queue and optionally write one byte to the wake-up pipe
   ([`sched.ml:88-95`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio_posix/sched.ml#L88-L95)).
   Those functions are explicitly documented as safe to call "from anywhere (other
-  systhreads, domains, signal handlers, GC finalizers)" and to take no locks. **Nothing
-  raises an exception through OCaml frames from this handler.**
+  systhreads, domains, signal handlers, GC finalizers)" and to take no locks
+  ([`sched.ml:87-95`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio_posix/sched.ml#L87-L95));
+  the whole `resume_all` path is likewise documented signal-safe with a "must not raise"
+  obligation on its callbacks
+  ([`broadcast.mli:13-28`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio/core/broadcast.mli#L13-L28),
+  [`cells.mli:68`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio/core/cells.mli#L68)).
+  **Nothing raises an exception through OCaml frames from this handler.**
 
 - The io_uring (Linux) backend installs **no** SIGCHLD handler at all: it reaps
   children with a pidfd and a plain `waitpid`
@@ -335,7 +342,10 @@ downstream resource bracket (`Path.with_open_*`, `Pool`, process spawn, `Buf_wri
   signal-safe `broadcast` that only enqueues; SIGPIPE is merely ignored; io_uring and
   Windows backends install no handler. No `Sys.Break`, no `Sys.catch_break`.
 - **`Gc.finalise` / `Gc.create_alarm` / memprof / `setitimer` / `Unix.alarm`** — none
-  in Eio's library code.
+  in Eio's library code. (The only `setitimer` / SIGALRM hit is in a Linux backend
+  *test*, [`lib_eio_linux/tests/test.ml:201-212`](https://github.com/ocaml-multicore/eio/blob/b114ab09d28809afa92f4e23f81ef6f1aa623b62/lib_eio_linux/tests/test.ml#L201-L212),
+  which checks an OCaml signal handler still runs while sleeping in liburing — test
+  scaffolding, not shipped library code, so out of scope.)
 - **`Eio.Cancel.Cancelled` / cooperative cancellation** — ordinary exception on the
   normal path; unaffected.
 - **Wildcard handlers** — Eio's library code has no bare `with _ ->` recovery handler;

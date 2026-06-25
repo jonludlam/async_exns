@@ -17,8 +17,17 @@ ordinary one. We call these "asynchronous exceptions" below.
   `Util.Timeout`, raised from the `SIGVTALRM`/`ITIMER_VIRTUAL` signal handler.
   Nothing else is affected — Ctrl+C calls `exit` directly, and there is no caught
   `Stack_overflow` or `Out_of_memory`, and no finalisers.
-- **Throwing side:** the `SIGVTALRM` handler must throw `Util.Timeout` the new way
-  (`Sys.raise_async`), or the timeout will stop the program instead of propagating.
+- **Throwing side — and a sharper, empirically-confirmed problem.** `Util.Timeout` is a
+  *custom* exception raised from a signal handler. On the OxCaml switch we tested
+  (`5.2.0+ox`, see `../experiments/RESULTS.md`), a custom exception raised from a signal
+  handler **terminates the program**, and `Sys.with_async_exns` does **not** rescue it —
+  only `Sys.Break` and `Stack_overflow` are deliverable as asynchronous exceptions, and
+  that switch has **no `Sys.raise_async`**. So on this OxCaml the timeout mechanism, as
+  written, is **broken outright** (every timeout kills the process) and *cannot* be fixed
+  with a wrapper: it must be restructured — e.g. have the handler `raise Sys.Break`
+  (which *is* async-deliverable and catchable via `with_async_exns`), or make the timeout
+  cooperative (set a flag, raise at a check-point). A future OxCaml with `Sys.raise_async`
+  would give a third option (raise `Util.Timeout` via `raise_async`).
 - **One genuine, active bug:** `steps.ml:206` `apply_without_step_limit` — a timeout
   during `SAT.push` permanently turns off `--steps-bound` for the rest of the session.
 - **Three spots that are safe today only by luck (and therefore fragile):**
@@ -42,9 +51,12 @@ signal handler** — which is exactly an asynchronous exception under the new mo
 - Fired:   `options.ml:899` sets `timeout := fun () -> raise Util.Timeout`
   (`exec_timeout` calls it). The timer is armed with `Unix.setitimer ITIMER_VIRTUAL`
   in `options.ml:921` `Time.set_timeout`.
-- Caught: there are 13 ordinary `with Util.Timeout ->` sites, mostly in
-  `satml_frontend.ml` (956, 1096, 1139, 1149, 1261), plus `frontend.ml:478`,
-  and the outermost `solving_loop.ml:269` / `solving_loop.ml:854`.
+- Caught: there are 12 ordinary `with Util.Timeout ->` sites — in
+  `satml_frontend.ml` (957, 1096, 1139, 1149, 1261), `frontend.ml:478`,
+  `solving_loop.ml:227` and `solving_loop.ml:269`, and `fun_sat.ml` (901, 1183,
+  1434, 1446). The outermost catch-all `solving_loop.ml:854` is a `with exn ->`
+  wildcard that funnels the timeout into `handle_exn` (whose `Util.Timeout` arm is
+  `solving_loop.ml:269`).
 
 Because the timer can fire at **any** safe point, `Util.Timeout` is the only
 asynchronous exception this program can produce this way (see "Checked and fine"
@@ -79,7 +91,7 @@ catchable `Sys.Break`) could pass through the same code.
 
 | Site | Clean-up | Verdict | Why |
 |------|---------|---------|-----|
-| `steps.ml:206-215` `apply_without_step_limit` | restore `steps_bound` (`exception e -> steps_bound := bound; raise e`) | **GENUINE BUG** | `steps_bound` is a long-lived global (set only by `--steps-bound` / `set_steps_bound`; *not* reset per goal — `reset_steps` only zeroes counters). A timeout during the wrapped `SAT.push` (`frontend.ml:297`) leaves it stuck at `-1`, which **silently disables the step limit for the rest of the session** (`steps.ml:148` `!steps_bound <> -1 && …`). A lasting broken invariant. |
+| `steps.ml:206-215` `apply_without_step_limit` | restore `steps_bound` — it sets `steps_bound := -1` (`steps.ml:208`) then restores `steps_bound := bound` in **both** match arms (`steps.ml:211` on success, `steps.ml:214` `\| exception e -> steps_bound := bound; raise e`) | **GENUINE BUG** | An asynchronous `Util.Timeout` during the wrapped `SAT.push` bypasses the whole `match … with`, so *neither* restore arm runs and `steps_bound` is left at `-1`. `steps_bound` is a long-lived global (set only by `--steps-bound` / `Steps.set_steps_bound`, called from `parse_command.ml:467` / `d_state_option.ml:100`; *not* reset per goal — `reset_steps`/`reinit_steps` only zero the counters, never the bound — verified `steps.ml:157-185`). So `-1` **silently disables the step limit for the rest of the session** (`steps.ml:148` `!steps_bound <> -1 && …`). A lasting broken invariant. |
 | `matching.ml:664-671` `query` | `reset_cache_refs ()` (`with e -> reset_cache_refs (); raise e`) | safe today, only by luck | `query` also calls `reset_cache_refs ()` at its **start** (`matching.ml:662`), and the caches (`cache_are_equal_light/full`) are module-private, query-local memoization. The next `query` resets them before any read, so a skipped trailing reset only **keeps the maps in memory** until then — no broken invariant. Fragile if those caches ever gain a reader outside `query`. |
 | `options.ml:939` `Time.with_timeout` | `Fun.protect ~finally:unset_timeout` | safe today, only by luck | `ITIMER_VIRTUAL` is **one-shot** (`it_interval = 0.`, `options.ml:926`). The *only* exception that skips `finally` is `Util.Timeout` — i.e. the timer having **already fired and spent itself**. So no live timer leaks into the next goal. It becomes a real leak only if a second asynchronous exception (Ctrl+C) can unwind through `with_timeout` while the timer is still armed. |
 | `timers.ml:353-359` `with_timer` | `Fun.protect ~finally:timer_pause` | low severity (diagnostic) | profiling-only; see below. |
@@ -233,12 +245,16 @@ wrapper (2 sites) are **complementary, not substitutes**.
   (`signals_profiling.ml`); profiling-mode Ctrl+C just toggles display. Only SIGVTALRM
   raises. (`profiling.ml:121` arms a *separate* `ITIMER_PROF`/SIGPROF timer purely for
   periodic profiling prints — harmless.) No `Sys.Break` anywhere.
-- **Wildcard handlers** — 7 total; the only one that restores state is `matching.ml:669`
-  (covered in the clean-up table above). The rest: `with _ -> assert false`
-  impossible-case guards (`theory.ml:157`, `satml.ml:643` — an asynchronous exception
-  skipping them is, if anything, *more* correct); a `with _ -> false` char check
-  (`frontend.ml:312`); a pure memoization fallback (`models.ml:145`); startup
-  plugin-load error reporting (`config.ml:50`, outside any timeout scope).
+- **Wildcard / catch-all handlers** — 8 total (`models.ml:145`, `frontend.ml:312`,
+  `steps.ml:213`, `theory.ml:157`, `satml.ml:643`, `matching.ml:669`, `config.ml:50`,
+  `solving_loop.ml:854`). The two that restore state are `steps.ml:213` and
+  `matching.ml:669` — both covered in the clean-up table above. The rest:
+  `with _ -> assert false` impossible-case guards (`theory.ml:157`, `satml.ml:643` — an
+  asynchronous exception skipping them is, if anything, *more* correct); a `with _ -> false`
+  char check (`frontend.ml:312`); a pure memoization fallback (`models.ml:145`); startup
+  plugin-load error reporting (`config.ml:50`, a `with e ->`, outside any timeout scope);
+  and the outermost `solving_loop.ml:854` `with exn ->` (the process-teardown catch-all
+  that routes to `handle_exn` — a result-conversion/abort site, not a state restoration).
 - **Plugins (`fm-simplex`)** — no `Timeout` catches, no signals, no
   `Fun.protect`/clean-up. Clean.
 - **JS / worker build (`worker_js.ml`)** — no signals; its `Timeout _` is a result-type

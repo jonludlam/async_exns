@@ -56,10 +56,16 @@ the session. That recovery is exactly what the new model breaks.
   handler for `SIGHUP` and `SIGTERM` that raises a *custom* exception,
   [`Term signo`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L1459-L1470),
   from inside the signal handler. `Term` is not `Sys.Break`, so OxCaml will **not**
-  make it asynchronous automatically: under the new model an ordinary
-  exception escaping a signal handler terminates the program. To keep raising it from
-  the handler it must be thrown with the new throwing primitive (`Sys.raise_async`).
-  (See the note below on whether utop even needs to raise it at all.)
+  make it asynchronous automatically: under the new model an ordinary exception escaping
+  a signal handler terminates the program. **Empirically confirmed** on the OxCaml switch
+  we tested (`5.2.0+ox`, see `../experiments/RESULTS.md`): a custom exception raised from
+  a signal handler terminates the process, and `Sys.with_async_exns` does **not** rescue
+  it (only `Sys.Break`/`Stack_overflow` are deliverable), and that switch has **no
+  `Sys.raise_async`**. So on this OxCaml `Term` simply cannot be made async — the only
+  options are to **drop it** (raise nothing; let the default SIGHUP/SIGTERM termination
+  happen) or raise `Sys.Break` instead. Since `Term` is never caught by name anyway (see
+  the note below), dropping it is the natural fix; a future OxCaml with `Sys.raise_async`
+  would also allow raising `Term` via that primitive.
 - **The one `Sys.Break` handler that is *not* affected** is the one in
   [`read_phrase`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L700-L716)
   (`| Sys.Break -> … "Interrupted." … read_phrase term`). That `Sys.Break` is **not**
@@ -330,11 +336,12 @@ at the evaluation step.
   — SIGINT is set to `Signal_ignore` while reading, so no `Sys.Break` is raised there;
   only the save/restore clean-up could be skipped (by `Stack_overflow`), and that is
   moot while the session is dying. Listed in the table for hygiene.
-- **The pure `with _ -> None` guards** in the rewrite-rule machinery
+- **The pure `with _ ->` guards** — the two in the rewrite-rule machinery
   ([`uTop_main.ml:598`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L595-L599),
-  [`:627`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L621-L629),
-  [`:1463`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L1460-L1466))
-  — these turn any failure into a default (`None`, or "signal not supported"). They
+  [`:627`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L621-L629))
+  return `None`, and the one in the `catch signo` helper inside `common_init`
+  ([`:1463`](https://github.com/ocaml-community/utop/blob/8cd6716d0f90efd67da90afa5bc31c7abe9a7a57/src/lib/uTop_main.ml#L1460-L1466))
+  swallows a failed `Sys.set_signal` ("signal not supported"). They
   release no resource and restore no state; an asynchronous exception simply skips the
   default and propagates, which is acceptable.
 - **The Emacs output-copy `Thread.create`**

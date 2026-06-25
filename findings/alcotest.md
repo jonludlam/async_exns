@@ -140,9 +140,18 @@ backends have to be treated separately:
   Async's `try_with` runs the test inside a monitor that captures *all* exceptions, with
   no exclusion for the runtime ones, so today a `Stack_overflow` becomes a recorded
   failure just as in the synchronous case — and under OxCaml it bypasses the monitor the
-  same way. So the change applies here too. (Async's monitor internals were not read
-  directly here; this rests on `try_with` having no `Stack_overflow` exclusion, which is
-  worth a quick confirmation.)
+  same way. So the change applies here too. This was verified by reading async_kernel
+  (`janestreet/async_kernel` @ `5815f4aea1400ea1666d27b9e2682a2ecf73686b`): the function
+  passed to `try_with` is ultimately run via `Monitor.Exported_for_scheduler.within_context`
+  ([`src/monitor.ml#L249-L256`](https://github.com/janestreet/async_kernel/blob/5815f4aea1400ea1666d27b9e2682a2ecf73686b/src/monitor.ml#L249-L256)),
+  which wraps it in `Base.Result.try_with` (a plain `try … with exn -> …` wildcard, no
+  exception-class filter) and forwards any caught exception to the installed monitor via
+  `send_exn`. `try_with`/`try_with_aux`
+  ([`src/monitor.ml#L422-L461`](https://github.com/janestreet/async_kernel/blob/5815f4aea1400ea1666d27b9e2682a2ecf73686b/src/monitor.ml#L422-L461))
+  then surfaces that as `Error exn`; the optional `extract_exn` only unwraps the monitor's
+  own wrapper and does **not** filter by exception class. There is no `Stack_overflow` /
+  `Out_of_memory` exclusion anywhere on that path, so on stock OCaml `try_with` does catch
+  `Stack_overflow` — confirming the change applies to `alcotest-async`.
 - **`alcotest-lwt`** instantiates the engine with the `Lwt` module directly, so `M.catch`
   is `Lwt.catch`. Crucially, `Lwt.catch` guards its call with
   [`try f () with exn when Exception_filter.run exn -> fail exn`](https://github.com/ocsigen/lwt/blob/59daedd52c76eeca65e6198e4196660845177458/src/core/lwt.ml#L2026-L2029),
@@ -296,6 +305,11 @@ and convert to ordinary only at the one explicit per-test `Sys.with_async_exns` 
 - **The skipped stream restore really does send later output to the log file** —
   verified empirically: redirecting stdout via `dup2`, skipping the restore, then
   printing shows the text landing in the file, not the terminal.
+- **`alcotest-async`'s `try_with` really does catch `Stack_overflow` today** — verified by
+  reading async_kernel (`@5815f4a`): the test runs inside `Monitor` via a plain
+  `Base.Result.try_with` wildcard with no runtime-exception filter, and `extract_exn` only
+  unwraps the monitor wrapper. So the change applies to `alcotest-async` just as to the
+  synchronous runner. (Previously flagged as un-inspected; now resolved.)
 - **The Lwt/Async/Mirage timeouts are cooperative, not signal-based** — `alcotest-async`
   uses
   [`Clock.with_timeout`](https://github.com/mirage/alcotest/blob/b26e58f62c93895f24a5ee48b550f274db74ee55/src/alcotest-async/alcotest_async.ml#L4-L10)

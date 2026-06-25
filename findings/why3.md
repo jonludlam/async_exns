@@ -118,7 +118,11 @@ exception.
 
 Why3 manipulates large terms and is deeply recursive, so the runtime can still raise
 `Stack_overflow` asynchronously. But Why3 **catches it nowhere** (a whole-repository
-search for `Stack_overflow` finds a single hit, and that is a *printer* — see "Checked
+search for `Stack_overflow` finds a single hit, and it is not OCaml code at all: it is a
+text-matching rule in a prover driver,
+[`drivers/alt_ergo_common.drv:15`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/drivers/alt_ergo_common.drv#L15),
+which classifies the literal stderr string `"Fatal error: exception Stack_overflow"`
+printed by an Alt-Ergo *child* process as an out-of-memory result — see "Checked
 and fine"). It is uncaught and fatal today, and it stays uncaught and fatal under the
 new rules. There is therefore **no recovery path that the change can break**, and the
 only thing to assess is the clean-up that a `Stack_overflow` skips on its way out
@@ -239,9 +243,14 @@ resource safety is the same either way.
 ## Checked and fine
 
 - **`Stack_overflow`** — listed as an asynchronous exception by the design doc; Why3 is
-  deeply recursive, but there are **zero** catch sites. It crashes uncaught today and
-  stays that way; no behaviour change beyond the (backstopped / benign) skipped clean-up
-  in the table above.
+  deeply recursive, but there are **zero** catch sites in the OCaml code. The only
+  whole-repository hit is in a prover driver,
+  [`drivers/alt_ergo_common.drv:15`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/drivers/alt_ergo_common.drv#L15)
+  (`outofmemory "Fatal error: exception Stack_overflow"`), which is a regexp that matches
+  the stderr text of an Alt-Ergo *child* process and classifies that prover run as
+  out-of-memory — it is not Why3 catching its own `Stack_overflow`. So `Stack_overflow`
+  crashes uncaught today and stays that way; no behaviour change beyond the (backstopped /
+  benign) skipped clean-up in the table above.
 - **`Out_of_memory`** — the single hit
   ([`wserver.ml:133`](https://gitlab.inria.fr/why3/why3/-/blob/2d6fbb02b4101d0fb9062d2b2a2a62f0838c0734/src/ide/wserver.ml#L123-L152))
   is inside `print_exc`, a function that *formats an exception for an error message*;

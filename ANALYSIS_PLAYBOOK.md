@@ -13,22 +13,64 @@ Under OxCaml it travels a **separate path**: a normal `try … with` no longer c
 it — it propagates to the nearest `Sys.with_async_exns` boundary or terminates the
 program. Two consequences:
 
-- **Raise side:** a *custom* exn raised from a signal handler must be raised via
-  `Sys.raise_async`, else it terminates the program. **BUT `Sys.Break` is already
-  handled:** OxCaml automatically makes the `Sys.Break` escaping a signal handler —
-  including the handler installed by the standard `Sys.catch_break true` — an async
-  exception. So a program that catches Ctrl+C via `Sys.catch_break` (or by raising
-  `Sys.Break` from its own SIGINT handler) needs **no raise-side change at all**; the
-  async `Sys.Break` comes for free. Raise-side work is only for *other* exceptions a
-  program throws from a handler/finaliser (e.g. alt-ergo's custom `Util.Timeout` from a
-  SIGVTALRM handler). A plain `raise Sys.Break` from ordinary (non-handler) code stays a
-  normal synchronous exception.
+- **Raise side:** **`Sys.Break` is already handled** — OxCaml automatically makes the
+  `Sys.Break` escaping a signal handler an asynchronous exception, whether from the
+  standard `Sys.catch_break true` *or* from a program's own `Sys.Signal_handle` that does
+  `raise Sys.Break`. Both come for free; no raise-side change. (Empirically confirmed —
+  see `experiments/RESULTS.md`.) A plain `raise Sys.Break` from ordinary (non-handler)
+  code stays a normal synchronous exception.
+  **A *custom* exception raised from a signal handler / finaliser / memprof callback is the
+  hard case, and on the `with_async_exns`-only OxCaml there is NO clean fix:** it
+  **terminates the program**, and `Sys.with_async_exns` does **not** rescue it (only
+  `Sys.Break` and `Stack_overflow` are deliverable). That switch has **no `Sys.raise_async`**.
+  So a custom timeout/termination exception thrown from a handler (alt-ergo's `Util.Timeout`
+  from `SIGVTALRM`; utop's `Term` from `SIGHUP`/`SIGTERM`) must be **restructured** — raise
+  `Sys.Break` instead (async-deliverable), or make it cooperative (set a flag, raise at a
+  check-point) — *not* merely wrapped. Only a future OxCaml that adds `Sys.raise_async`
+  would let such an exception be raised asynchronously as-is. **Verify which OxCaml you
+  target** (`grep raise_async`/`with_async_exns` in its `sys.mli`) before recommending a
+  raise-side fix. (Empirically confirmed on `5.2.0+ox`.)
 - **Catch side:** existing handlers stop firing; you need a `Sys.with_async_exns`
   boundary to convert async→normal *at that point*.
 
 Target class: code **sound today but silently broken** — cleanup / state-restoration
 / resource release living in a handler or `Fun.protect ~finally` that will no longer
 run, leaving leaked resources or broken invariants.
+
+## Rigor — don't assume, verify, and flag what you couldn't
+
+Treat every claim in a report as something you must have **checked**, not inferred. The
+priors and patterns below are starting hypotheses, never conclusions. The mistakes this
+survey actually made were all assumptions that turned out false — guard against them:
+
+- **Verify behaviour from the code, not from names or conventions.** Read the actual
+  `try … with` arms, the actual signal-handler body, the actual `catch` implementation —
+  do not infer from a function's name or a usual pattern. Assumptions that were wrong here:
+  - *"`protect_test` is a wildcard that catches everything"* — it is `M.catch`, whose
+    behaviour differs per backend (identity catches all; Lwt's default filter excludes
+    `Stack_overflow`). **Check every functor instantiation**, not one.
+  - *"the surface is the OCaml code"* — Rocq's real reduction path is a C bytecode VM
+    that allocates and polls for signals. **Check C stubs / FFI** (step 6).
+  - *"a raising SIGINT handler needs a throwing-side change"* — `Sys.catch_break` /
+    `Sys.Break` is already made asynchronous by OxCaml. **Check the actual semantics.**
+- **Confirm reachability and existence.** Before "this handler catches X today", confirm
+  X can actually reach it. Before "the fix covers all callers", confirm the caller set.
+  Before "there is a daemon mode", find it. Before "it's caught nowhere", grep and read.
+- **Read the signal-handler body** to decide asynchronous vs cooperative (step 2) — never
+  guess from the exception's name; the same exception can be either.
+- **Verify runtime claims empirically** where cheap (step 8). For OxCaml-specific
+  behaviour you cannot run here, do **not** assert it — say it needs confirmation.
+- **Re-read your own draft adversarially.** For each verdict — especially "genuine bug",
+  "no change", and "safe" — ask *"what would make this wrong, and did I actually check
+  it?"* Trace the load-bearing claims twice before committing them.
+- **Separate verified fact from inference, and flag every uncertainty in the report.**
+  Anything you did not directly verify — OxCaml runtime behaviour, internals of a
+  dependency you didn't clone, a summarising tool's output you couldn't reproduce — must
+  appear in the report as an explicit open question / assumption, with *what would resolve
+  it* and *how the verdict changes if it's wrong*. Use hedged language ("appears to",
+  "needs confirmation") for unverified claims and reserve definite language for checked
+  ones. Never present a guess as a finding, and never drop a known gap to make the report
+  read more cleanly. A flagged uncertainty is a feature of the report, not a weakness.
 
 ## What the survey found (priors — anchor on these, but still verify per package)
 
@@ -190,6 +232,20 @@ package; their *absence* is where the bugs are. They are also the fixes to recom
      the fiber wrapper today and the daemon keeps serving; under the new model it
      bypasses the wrapper and kills the daemon — fix with a per-iteration
      `with_async_exns` boundary in the poll loop.)*
+     **But verify BOTH halves before calling it a bug — two ways the claim is false
+     (both found in this survey):** (a) *Does the loop actually catch the async exn
+     today?* A plain-OCaml `try … with` does catch `Stack_overflow`; but an
+     `Lwt.catch`/`try_bind` is guarded by `Lwt.Exception_filter` whose **default
+     (`handle_all_except_runtime`) excludes `Stack_overflow`/`Out_of_memory`** — so an
+     Lwt server may *already* not recover (no change to lose). Read the actual catch and,
+     for a concurrency lib, its filter/default — don't assume. *(irmin-server: the
+     per-request `Lwt.catch` does not catch `Stack_overflow` on default Lwt → no day-one
+     bug, version-dependent.)* (b) *Does the loop actually CONTINUE after catching, or is
+     the exn the shutdown path?* If the handler re-raises to exit (the loop's whole job on
+     that exn is to stop), there is no recover-and-continue to lose. *(Frama-C `-server`:
+     Ctrl+C is caught only to leave the loop and terminate → no day-one bug; the skipped
+     state-restore is a latent hazard only if a future per-request wrapper makes the loop
+     survive.)*
    Label survivors **benign-by-accident → fragile**: still convert to `new_protect`
    (hygiene + they break the moment a second async exn enters scope, e.g. an
    async-catchable `Sys.Break`), but they're not day-one bugs.
@@ -325,6 +381,12 @@ Format: `https://github.com/<org>/<repo>/blob/<FULL_SHA>/<path>#L<start>-L<end>`
   exception is an event — pressing Ctrl+C, a timeout going off, or running out of stack —
   that can surface at almost any point in the program"*), then use it consistently.
   Ordinary words like "interrupt"/"interruption" are fine in their everyday sense.
+- **State uncertainty explicitly (see "Rigor").** Every claim should be either verified
+  (and stated plainly) or flagged as unverified (and stated as such). The report MUST have
+  an "Open questions" section that lists each thing you did not verify — OxCaml-runtime
+  behaviours, un-cloned dependency internals, anything assumed — with what would resolve
+  it and how the verdict would change if it's wrong. Don't state an unverified thing in
+  the Bottom line as fact.
 
 ### 1. One-paragraph summary (max one paragraph)
 

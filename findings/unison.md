@@ -19,10 +19,10 @@ that wrapper or stops the program.
 ## Bottom line
 
 - **Unison turns Ctrl+C into `Sys.Break`, but in two stages, and only the second stage is
-  asynchronous.** In the text interface, the first one or two Ctrl+C presses run a signal
+  asynchronous.** In the text interface, the first three Ctrl+C presses run a signal
   handler that merely sets a flag (`Abort.all ()`) — a *cooperative* request that the
   transport engine notices at its own checkpoints and turns into an ordinary `Util.Transient`
-  exception. Only the **third (and later) Ctrl+C** actually `raise Sys.Break` *from inside
+  exception. Only the **fourth (and later) Ctrl+C** actually `raise Sys.Break` *from inside
   the signal handler*
   ([`uitext.ml:919-925`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L936)),
   to force immediate termination. That forced `Sys.Break` is the genuine asynchronous
@@ -122,14 +122,18 @@ Unison's text UI installs its own `SIGINT` handler `ctrlCHandler`
 ([`uitext.ml:924-936`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L959), via
 `stopAtIntr`) around the whole transfer phase. Its behaviour is graduated:
 
-1. **First / second Ctrl+C** → `Abort.all ()`
+1. **First / second / third Ctrl+C** → `Abort.all ()`
    ([`abort.ml:59`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/abort.ml#L59))
-   sets a flag and prints a message; **nothing is raised from the handler**. The transport
+   sets a flag and prints a message; **nothing is raised from the handler**. The handler
+   guard is `if !intrcount >= 3 then raise Sys.Break` *before* incrementing, so presses
+   1/2/3 (which see `intrcount` 0/1/2) only `Abort.all ()` and bump the counter; the on-screen
+   message after the first press even tells the user to "press Ctrl-C 3 more times" (i.e. a
+   total of four). The transport
    engine notices the flag at its own checkpoints (`Abort.check` / `Abort.checkAll`,
    [`abort.ml:65-75`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/abort.ml#L65-L75))
    and raises an ordinary `Util.Transient "Aborted by user request"` — a *cooperative*
    cancellation along the normal path, unaffected by the change.
-2. **Third+ Ctrl+C** → `raise Sys.Break`
+2. **Fourth+ Ctrl+C** → `raise Sys.Break`
    ([`uitext.ml:920`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L922))
    *from inside the handler*. This is the genuine asynchronous exception: today it surfaces
    at the next safe point and one of the `with Sys.Break` / catch-all handlers above catches
@@ -252,8 +256,8 @@ Verdicts assume the genuine asynchronous exception is a forced `Sys.Break` (3rd+
    handler happens to be innermost at that instant catches it. The handlers are written
    defensively precisely because Ctrl+C can land anywhere.
 2. **Graceful vs forced Ctrl+C is the key split, and only the forced path is asynchronous.**
-   The first two presses are cooperative (`Abort.all ()` → checkpoint → `Util.Transient`,
-   the normal path), and remain so. Only the third+ press raises an asynchronous `Sys.Break`
+   The first three presses are cooperative (`Abort.all ()` → checkpoint → `Util.Transient`,
+   the normal path), and remain so. Only the fourth+ press raises an asynchronous `Sys.Break`
    from the handler.
 3. **The handlers form a clean-up-then-decide chain.** A forced Ctrl+C deep in a transfer
    runs, innermost-out:
@@ -308,8 +312,9 @@ Ctrl+C — against the model. Best: interruption-safe `Copy.protect` + one expli
 - **Forced Ctrl+C is the only asynchronous `Sys.Break`; graceful Ctrl+C is cooperative.**
   Confirmed by reading `ctrlCHandler`/`sigtermHandler`
   ([`uitext.ml:919-936`](https://github.com/bcpierce00/unison/blob/91421d0617b0fb543c0eee51bcb4d4791d8b0631/src/uitext.ml#L919-L936)):
-  presses 1–2 call `Abort.all ()` (flag → checkpoint → `Util.Transient`, normal path); only
-  press 3+ raises `Sys.Break` from the handler. The single most important fact for Unison.
+  presses 1–3 call `Abort.all ()` (flag → checkpoint → `Util.Transient`, normal path); only
+  press 4+ raises `Sys.Break` from the handler (the `intrcount >= 3` guard fires before the
+  increment). The single most important fact for Unison.
 - **Throwing side needs no change** — OxCaml already makes a `Sys.Break` escaping a signal
   handler asynchronous, and Unison both uses `Sys.catch_break true` and its own handler that
   raises `Sys.Break`.

@@ -295,13 +295,18 @@ globals in [`rocq_memory.c#L29-L39`](https://github.com/rocq-prover/rocq/blob/1a
 
 Three things make it relevant here:
 
-- It **allocates OCaml values as it runs** (`Alloc_small` / `caml_alloc_shr`,
-  [`rocq_interp.c#L35-L42`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L35-L42)),
+- It **allocates OCaml values as it runs** — small blocks via the `Alloc_small`
+  macro ([`rocq_interp.c#L35-L42`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L35-L42))
+  and larger ones via `caml_alloc_shr` (e.g. [`rocq_interp.c#L811`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L811)) —
   so it interacts with the garbage collector.
 - It **deliberately polls the runtime for pending signals at a controlled point** —
-  the `check_stack` step calls `caml_process_pending_actions`
+  the `check_stack` step calls `caml_process_pending_actions_exn()` (the
+  result-returning variant, *not* the directly-raising `caml_process_pending_actions`)
   ([`rocq_interp.c#L611-L642`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L611-L642)).
-  This is where a Ctrl+C surfaces during reduction.
+  This is where a Ctrl+C surfaces during reduction. Using the `_exn` variant is exactly
+  what lets the VM inspect the returned value for an exception
+  (`Is_exception_result`) and reset its own stack *before* re-raising, rather than have
+  the runtime raise directly out of the poll.
 - When an exception leaves the VM it **first resets its own stack pointer**
   (`rocq_sp = rocq_stack_high`) and *then* raises
   ([`rocq_interp.c#L135-L140`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L135-L140));
@@ -482,7 +487,7 @@ plus the explicit `Sys.with_async_exns` wrappers above.
   VM"). The VM catches a pending Ctrl+C at its poll and re-raises it with plain
   `caml_raise`, which would convert it back to an ordinary exception. Confirm
   against the runtime whether a pending `Sys.Break` is even delivered through
-  `caml_process_pending_actions` under the new model, and if so whether the VM
+  `caml_process_pending_actions_exn` under the new model, and if so whether the VM
   should re-raise on the asynchronous path to keep it from being caught in the
   wrong place during reduction.
 

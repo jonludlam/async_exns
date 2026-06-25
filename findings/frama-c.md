@@ -56,9 +56,28 @@ back into an ordinary one. We call these "asynchronous exceptions" below.
   and the "apply once" status reset in
   [`state_builder.ml:1032-1041`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/state_builder.ml#L1029-L1042).
   Both restore a long-lived global through a handler / `Fun.protect ~finally` that an
-  asynchronous `Sys.Break` would skip; they are not day-one bugs only because the
-  batch process is exiting anyway, but they become real bugs in the **long-lived
-  server (`-server`) mode**, which keeps running after a Ctrl+C.
+  asynchronous `Sys.Break` would skip. The skipped restore is **real** — verified by
+  reading both — but **a Ctrl+C does not, in fact, leave the server running**: the only
+  `Sys.Break` handling in `-server` mode is the main-loop guard
+  [`while … with Sys.Break -> ()`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L524-L531),
+  whose comment is "Ctr+C, just leave the loop normally". Today a Ctrl+C **shuts the
+  server down** (exit the loop → clean shutdown at
+  [`:532-535`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L532-L535)).
+  Under the new model the asynchronous `Sys.Break` skips that loop guard and is caught
+  instead by the outer
+  [`with exn -> … ; raise exn`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L536-L541),
+  which prints "Server interrupted (fatal error)", goes offline, and **re-raises** — the
+  server still terminates. So in **both** models the server stops after a Ctrl+C and no
+  later request is served. The corrupted globals (`Project.on`'s wrong current project,
+  `apply_once`'s stuck flag) are therefore **never observed by a later request** in the
+  current code, because there is no later request. These remain real hygiene problems
+  (an in-memory invariant is broken on the way out, and the change *visibly* turns
+  today's clean "leave the loop normally" shutdown into a "fatal error" shutdown), but
+  the claimed "wrong project for every later request" consequence does **not** occur as
+  the server is written. It *would* occur if a future `Sys.with_async_exns`-per-request
+  boundary were added that let the loop survive a Ctrl+C — which is exactly the
+  remediation below, so the fix must restore both the loop guard *and* the skipped
+  state restores together.
 - **Places that catch the exception to decide what to do next** (turn it into a
   result, save partial work, choose an exit code): the batch top-level
   [`cmdline.ml:191-205`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/kernel_services/cmdline_parameters/cmdline.ml#L191-L205),
@@ -164,8 +183,8 @@ server mode. Verdicts below state the mode explicitly.
 | Site | Clean-up | Verdict | Why |
 |------|---------|---------|-----|
 | [`iterator.ml:643-648`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/iterator.ml#L631-L648) `Signal.protect compute ~cleanup` | save partial dataflow results (`mark_degeneration`, `merge_results`) when interrupted | safe today *because of* this wrapper — but the wrapper is the very thing that breaks | This is Eva's deliberate "save partial results on user interrupt" feature: `Signal.protect` (below) catches `Sys.Break`/`Self.Abort`, runs `cleanup`, then re-raises. Under the new model the `Sys.Break` case of `Signal.protect` stops firing, so partial results are **not** saved. Not a soundness bug (the lost data is best-effort partial output), but a **lost feature** — converting this wrapper to the interruption-aware bracket restores it. |
-| [`project.ml:426-428`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/project.ml#L400-L428) `Project.on` | restore the previously-current project (`Fun.protect ~finally:set_to_old`) | safe today only by luck (batch); **genuine bug in server mode** | `Project.on p f x` temporarily makes `p` the current project, runs `f`, and restores the old current project in `finally`. An asynchronous `Sys.Break` skips the restore, leaving the **wrong project current**. In one-shot batch this is moot (the process exits). In `-server` mode the server keeps running and every later request then operates on the wrong project — a lasting broken global. |
-| [`state_builder.ml:1032-1041`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/state_builder.ml#L1029-L1042) `apply_once` | reset the "already run" flag to `true` on failure so the computation can be retried (`with exn -> First.set true; raise exn`) | safe today only by luck (batch); **genuine bug in server mode** | `apply_once` runs a computation at most once and records that it ran. On failure it resets the flag so a later call retries. Eva's whole `compute` is wrapped in this ([`analysis.ml:281-283`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/analysis.ml#L281-L283)). An asynchronous `Sys.Break` skips the reset, leaving the flag at "done" → the next request that asks Eva to run sees it as **already computed** and silently returns nothing. Moot in batch (process exits); a real "Eva won't re-run" bug in server mode. |
+| [`project.ml:426-428`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/project.ml#L400-L428) `Project.on` | restore the previously-current project (`Fun.protect ~finally:set_to_old`) | safe today only by luck; fragile, **not** an observed server-mode bug as written | `Project.on p f x` temporarily makes `p` the current project, runs `f`, and restores the old current project in `finally` ([`project.ml:427-428`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/project.ml#L426-L428)). An asynchronous `Sys.Break` skips the restore, leaving the **wrong project current** — verified. But this corruption is only *observed* if the program keeps using projects afterwards. In one-shot batch the process exits. In `-server` mode the server also stops on a Ctrl+C (the loop guard / outer handler both end the loop; see Bottom line), so no later request reads the wrong project as the code stands. Real if a per-request `Sys.with_async_exns` boundary is later added so the loop survives Ctrl+C — then the skipped restore must be fixed together with that boundary. |
+| [`state_builder.ml:1032-1041`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/state_builder.ml#L1029-L1042) `apply_once` | reset the "already run" flag on failure so the computation can be retried (`with exn -> First.set true; raise exn`) | safe today only by luck; fragile, **not** an observed server-mode bug as written | `apply_once` runs a computation at most once: it flips the flag to `false` before running, and on failure the `with exn -> First.set true; raise exn` arm flips it back so a later call retries ([`state_builder.ml:1029-1042`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/state_builder.ml#L1029-L1042)). Eva's whole `compute` is wrapped in this ([`analysis.ml:281-283`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/analysis.ml#L281-L283)). An asynchronous `Sys.Break` skips the reset, leaving the flag at `false` → a later call sees `First.get () = false`, skips the body, and silently returns nothing — verified. But, as above, the server stops on a Ctrl+C, so there is no later Eva request to hit the stuck flag as the code stands. Real once a per-request boundary lets the server survive Ctrl+C; fix together with that boundary. |
 | [`analysis.ml:243-269`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/analysis.ml#L243-L269) `compute_from` | (a) `Fun.protect ~finally:restore_signals` restores the previous signal handlers; (b) `with exn -> ComputationState.set Aborted; …` marks Eva aborted | (a) fragile; (b) catch-to-decide | (a) If the `Fun.protect` is skipped by an asynchronous `Sys.Break`, Eva's `SIGINT`/`SIGUSR1` handlers stay installed after the analysis. In batch this is moot; in server mode it leaves Eva's handlers active outside an analysis, so a later Ctrl+C raises `Sys.Break` where the server doesn't expect it. (b) The `with exn ->` arm sets `ComputationState` to `Aborted` and re-raises — it *decides* the analysis state; under the new model it is skipped, so the state stays `Computing`. See remediation. |
 | [`signal.ml:58-76`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/signal.ml#L58-L76) `Signal.protect` | runs `cleanup` on `Sys.Break`/`Self.Abort`/`Log.Abort*`, then re-raises | catch-to-decide (the wrapper itself) | This is the bracket that the `iterator.ml:648` clean-up flows through. Its `Sys.Break` arm stops firing under the new model, so it must be rebuilt as an interruption-aware bracket (and/or paired with a `Sys.with_async_exns` boundary). The `protect_only_once` guard ([`signal.ml:56-64`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/signal.ml#L56-L64)) ensures `cleanup` runs once even on nested `protect`; rebuilding must preserve that. |
 | [`current_loc.ml:19-23`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/kernel_services/ast_queries/current_loc.ml#L19-L23) `with_loc` | restore the previous "current source location" (`Fun.protect ~finally:set oldLoc`) | low severity (diagnostic only) | The current location only feeds error/warning messages. A skipped restore leaves a stale location for later messages; no soundness, resource, or result impact. Moot in batch; cosmetic in server mode. |
@@ -206,8 +225,12 @@ The change splits in two:
   save, the signal-handler restore, the project/location restore and the
   `ComputationState := Aborted` are all lost unconditionally. Whether each one
   *matters* is per-site and per-mode (see the table): all are moot for in-memory
-  state in one-shot batch (the process exits), but the project/state restores become
-  real bugs in server mode.
+  state in one-shot batch (the process exits). They are *also* moot in `-server` mode
+  **as the server is currently written**, because a Ctrl+C ends the main loop and the
+  server shuts down rather than serving more requests (see Bottom line). They would
+  become real bugs only if a per-request `Sys.with_async_exns` boundary were added that
+  lets the loop survive a Ctrl+C — i.e. the fix has to restore both the loop guard and
+  the skipped restores at once.
 - **Depends on where the wrapper goes:** which *outer* handler wins. A high wrapper
   at `catch_toplevel_run` restores the clean exit code 2 and the save-on-`.break`
   hook, but bypasses Eva's partial-result save and `Aborted` marking below it.
@@ -318,13 +341,25 @@ leaks the handlers today; moving the install into `init` closes that gap.
     restores the clean exit code 2 and the save-on-`.break` hook. To *also* keep
     Eva's "save partial results on Ctrl+C", a second, lower boundary is needed below
     `Signal.protect` ([`iterator.ml:648`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/iterator.ml#L631-L648)).
-  - *Server:* a `Sys.with_async_exns` **per request** (around `proc.handler` in
-    [`server/main.ml:151-166`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L151-L166))
-    so a Ctrl+C turns back into an ordinary `Sys.Break` that the existing per-request
-    handler catches and reports, and the project/state restores below it still run.
-    Without this, an asynchronous `Sys.Break` bypasses the per-request handler and
-    the `while … with Sys.Break -> ()` loop guard alike, so it either kills the
-    server uncaught or (worse) leaves the wrong project current for later requests.
+  - *Server:* note first that the per-request handler `run`
+    ([`server/main.ml:151-166`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L151-L166))
+    **re-raises** `Sys.Break` ([`:158`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L158)),
+    as does `process` ([`:363-365`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L363-L365)),
+    so today a Ctrl+C is only ever *handled* by the main-loop guard
+    [`while … with Sys.Break -> ()`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L524-L531),
+    which **ends the loop and shuts the server down** — Ctrl+C is the shutdown
+    mechanism, not a per-request abort. Under the new model the asynchronous `Sys.Break`
+    bypasses that guard and is caught by the outer
+    [`with exn -> … ; raise exn`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L536-L541),
+    so the server still terminates (now via the "fatal error" path). The **observable**
+    change is therefore the *shutdown style* (clean → fatal-error), not "wrong project
+    for later requests" (there are no later requests). If the desired behaviour is
+    instead a per-request abort that lets the server keep serving, that is a *new*
+    design: add a `Sys.with_async_exns` per request (around `proc.handler`), change the
+    per-request handler so it does **not** re-raise `Sys.Break`, and fix `Project.on` /
+    `apply_once` so the now-surviving server isn't left with corrupted globals. Those
+    pieces are coupled — adding the per-request boundary *without* fixing the restores
+    is what would introduce the "wrong project current" bug.
 - **OxCaml confirmations** (need the runtime, not the source):
   - that a *hand-installed* `Signal_handle` raising `Sys.Break` (Eva's `interrupt`
     handler) is made asynchronous for free, the same way `Sys.catch_break` is — if
@@ -389,11 +424,19 @@ long-lived `-server` mode.
      lower wrapper below Eva's `Signal.protect`
      ([`iterator.ml:648`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/iterator.ml#L631-L648))
      to keep "save partial Eva results on Ctrl+C".
-   - *Server:* wrap each request handler
-     ([`server/main.ml:151-166`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L151-L166))
-     so a Ctrl+C becomes an ordinary `Sys.Break` the existing per-request and loop
-     handlers catch — and so the project/state restores below it run, keeping the
-     server consistent for later requests.
+   - *Server:* first decide the *intended* behaviour. Today a Ctrl+C is the server's
+     **shutdown** signal — the main-loop guard
+     [`while … with Sys.Break -> ()`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L524-L531)
+     ends the loop and the server stops (the per-request `run` re-raises `Sys.Break` at
+     [`:158`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L158)).
+     To merely **preserve** today's behaviour, wrap the loop body (or the whole loop)
+     in `Sys.with_async_exns` so the asynchronous `Sys.Break` becomes ordinary and the
+     `with Sys.Break -> ()` guard fires → clean shutdown instead of the "fatal error"
+     re-raise. If instead the goal is a per-request abort that keeps the server
+     serving, that is a behaviour *change*: add `Sys.with_async_exns` around
+     `proc.handler` ([`:151-166`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/server/main.ml#L151-L166)),
+     stop re-raising `Sys.Break` there, *and* fix the project/state restores below it
+     (recommendation 3) so the now-surviving server isn't left with corrupted globals.
 
 2. **Make Eva's `Signal.protect` interruption-aware.**
    ([`signal.ml:58-76`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/plugins/eva/src/engine/signal.ml#L58-L76))
@@ -402,14 +445,19 @@ long-lived `-server` mode.
    This restores Eva's deliberate partial-result feature, which otherwise silently
    stops working.
 
-3. **Fix the two state restorations that become server-mode bugs via `new_protect`
-   (independent of the wrapper placement):** `Project.on`
+3. **Make the two state restorations interruption-safe via `new_protect`
+   (hygiene; required *if* server-keeps-serving is adopted):** `Project.on`
    ([`project.ml:426-428`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/project.ml#L426-L428))
    and `apply_once`
    ([`state_builder.ml:1032-1041`](https://git.frama-c.com/pub/frama-c/-/blob/44585036cb05125b3128a173c7d98881c4bbdb42/src/libraries/project/state_builder.ml#L1029-L1042)).
-   These are kernel-wide primitives with many callers; rebuilding them as
-   interruption-safe brackets fixes "wrong project current" and "Eva won't re-run"
-   across every caller at once.
+   An asynchronous `Sys.Break` skips both restores (verified), leaving the wrong project
+   current and Eva's "already run" flag stuck. As the server is written this is **not**
+   observed (a Ctrl+C stops the server, so nothing reads the corrupted globals) — but
+   these are kernel-wide primitives with many callers, and the moment a per-request
+   boundary lets the server survive a Ctrl+C (recommendation 1, server variant) the
+   corruption becomes a live "wrong project current" / "Eva won't re-run" bug. Rebuilding
+   them as interruption-safe brackets fixes every caller at once and must land together
+   with that boundary.
 
 4. **Convert the remaining fragile restores to `new_protect` for robustness:**
    Eva's `restore_signals` `Fun.protect`
@@ -426,8 +474,14 @@ long-lived `-server` mode.
 
 **Sequencing note:** the throwing side needs essentially no work (`Sys.catch_break`
 and the hand-installed `Sys.Break` are already asynchronous on OxCaml), so (1) the
-wrapper placement can land on its own and restores today's behaviour; (3) is
-independent and is the only thing with a lasting (server-mode) correctness impact.
+wrapper placement can land on its own and restores today's behaviour. There is **no
+day-one correctness bug in either batch or server mode as the code stands**: a Ctrl+C
+ends a one-shot run or shuts the server down, and nothing reads the in-memory state
+left broken by a skipped restore. The (3) restores are a *latent* correctness hazard
+that only becomes a real bug if (1)'s server variant is taken in the
+"keep serving across Ctrl+C" direction — in which case (3) must land with it. Without
+the wrapper, the one *visible* server-mode change is the shutdown style (today's clean
+"leave the loop normally" becomes a "Server interrupted (fatal error)" re-raise).
 **Do *not*** rebuild the helpers so they turn the asynchronous exception into an
 ordinary one: Frama-C has many downstream `with Sys.Break` / catch-all arms that
 would then silently re-enable Ctrl+C swallowing — defeating the model.

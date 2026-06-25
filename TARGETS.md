@@ -18,11 +18,12 @@ The two large programs named in the design doc are also **DONE**:
   case is already guarded by `CErrors.is_async`, and state rolls back from immutable
   snapshots, not handlers; needs `Sys.with_async_exns` on the prompt/IDE recovery loops +
   the Unix timeout handler, and the `.vo` writer should write-then-rename).
-- **Frama-C** (`git+https://git.frama-c.com/pub/frama-c.git`) — **DONE**
-  (`findings/frama-c.md`: only `Sys.Break` matters; no batch-mode bug, but `-server` mode
-  has two real bugs — project-switch restore and the "apply once" reset are skipped on an
-  interrupting Ctrl+C; cancellation/prover-timeout are cooperative. GUI ships separately,
-  not yet reviewed).
+- **Frama-C** (`git+https://git.frama-c.com/pub/frama-c.git`) — **DONE** (verified)
+  (`findings/frama-c.md`: only `Sys.Break` matters; no batch-mode bug; cancellation/prover-timeout
+  are cooperative. The earlier "two server-mode bugs" (project-switch restore, "apply once" reset)
+  were **corrected on verification** — Ctrl+C is the server's *shutdown* path, so the server doesn't
+  keep serving and the skipped restores are a latent hazard, not a day-one bug. GUI ships
+  separately, not yet reviewed).
 
 ## The next 10
 
@@ -37,7 +38,7 @@ The two large programs named in the design doc are also **DONE**:
 | 7 | **merlin** + **ocaml-lsp-server** | Editor tooling used by ~every OCaml dev | Long-running daemon, signal handling, per-request timeouts/cancellation, catch-alls around request handling | `git+https://github.com/ocaml/merlin.git` / `git+https://github.com/ocaml/ocaml-lsp.git` — **DONE** (`findings/merlin-ocaml-lsp.md`: GENUINE BUG — merlin `server` mode self-corrupts after a stack overflow skips its per-query state restore; both lose per-request crash-recovery; fix = per-request `with_async_exns`) |
 | 8 | **alcotest** | The widely-used test framework (CI everywhere) | Per-test **timeouts** (alarm-based), catch-all around each test to report+continue, output/temp cleanup | `git+https://github.com/mirage/alcotest.git` — **DONE** (`findings/alcotest.md`: minor — no timer/signal use at all; a stack overflow in one test now aborts the whole run, and skipped stdout-restore hides the crash in a log file; per-test `with_async_exns` + interruption-safe stream restore) |
 | 9 | **unison** | Classic, widely-deployed file synchronizer | Signal handling, transactional cleanup on interrupt (partial-transfer invariants), Ctrl+C during sync | `git://github.com/bcpierce00/unison.git` — **DONE** (`findings/unison.md`: largely safe — file consistency rides on an on-disk commit log + atomic archive flip + at_exit lock release, not on catching Ctrl+C; two `with_async_exns` sites (text UI exit, socket-server cleanup)) |
-| 10 | **irmin** | Important Git-like store (Tezos/MirageOS ecosystem) | On-disk store consistency invariants, resource/handle cleanup on unwind, `Lwt.finalize` usage | `git+https://github.com/mirage/irmin.git` — **DONE** (`findings/irmin.md`: safe today — no own interrupting exn; on-disk consistency via atomic control-file rename; one real change in `irmin-server`'s per-request loop) |
+| 10 | **irmin** | Important Git-like store (Tezos/MirageOS ecosystem) | On-disk store consistency invariants, resource/handle cleanup on unwind, `Lwt.finalize` usage | `git+https://github.com/mirage/irmin.git` — **DONE** (verified) (`findings/irmin.md`: safe today — no own async exn; on-disk consistency via atomic control-file rename. The earlier "one real change in `irmin-server`" was **corrected on verification**: it depends on Lwt's exception filter, and the default (`handle_all_except_runtime`) excludes `Stack_overflow`, so the server already doesn't recover today → no day-one bug. Version-dependent.) |
 
 ## Notes on selection
 

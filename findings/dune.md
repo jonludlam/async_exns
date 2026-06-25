@@ -51,7 +51,8 @@ back into an ordinary one so the normal handlers can see it again.
   what to do next (report it and recover), not merely clean-up that happens to be
   skipped harmlessly.
 - **The fragile spots are the clean-up helpers** — `Exn.protect`/`protectx`
-  (stdune), `Mutex.protect` (stdune), `Fiber.finalize`/`Fiber.protect`, and the
+  (stdune), `Mutex.protect` (stdune), `Fiber.finalize`/`Fiber.protect`, the
+  standard-library `Fun.protect` (used in `stdune/src/readdir.ml`), and the
   threaded-console hand-rolled lock/clean-up loop. Each catches the exception only
   to clean up and then re-throw, using a `match … with exception e ->` or
   `with exn ->` arm that an asynchronous `Stack_overflow` bypasses. They are safe
@@ -182,14 +183,21 @@ finaliser/memprof exceptions) can travel through the same scope.
 
 | Site | Cleanup | Verdict | Why |
 |------|---------|---------|-----|
-| [`exn.ml:9-19`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/exn.ml#L9-L19) `Exn.protectx`/`protect` | run `finally x` then `raise e` | safe today, only by luck | The stdune analogue of `Fun.protect`. Used at ~12 sites (`csexp_rpc.ml`, `digest.ml`, `md5.ml`, `ocaml_config.ml`, `async_io.ml`, `scheduler.ml:408`) for fd/socket/cwd clean-up. An asynchronous `Stack_overflow` in the body skips `finally`, leaking the fd/leaving cwd changed — but the process is dying anyway, so it goes unnoticed today. This is the doc's "second version of `Fun.protect`" candidate. |
-| [`mutex0.ml:3-12`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/mutex0.ml#L3-L12) `Mutex.protect` | `unlock mutex` then `raise exn` | safe today, only by luck | ~25 callers (scheduler `async_io`, `thread_safe_channel`, `inotify`, `fsevents`, `dune_trace/out`, `alloc`). A skipped unlock would deadlock the owning worker thread, not the build — and only on a `Stack_overflow` inside the (tiny) critical section, after which the process is unwinding to death. Unnoticed today; a real deadlock risk the moment a recoverable asynchronous exception enters scope. |
+| [`exn.ml:9-19`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/exn.ml#L9-L19) `Exn.protectx`/`protect` | run `finally x` then `raise e` | safe today, only by luck | The stdune analogue of `Fun.protect`. Used at ~28 sites (e.g. `csexp_rpc.ml`, `digest.ml`, `md5.ml`, `ocaml_config.ml`, `async_io.ml`, `scheduler.ml:408`, plus `io.ml`/`fs_io.ml`/`proc.ml`/`platform.ml`/`console.ml` in stdune itself) for fd/socket/cwd clean-up. An asynchronous `Stack_overflow` in the body skips `finally`, leaking the fd/leaving cwd changed — but the process is dying anyway, so it goes unnoticed today. This is the doc's "second version of `Fun.protect`" candidate. |
+| [`mutex0.ml:3-12`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/mutex0.ml#L3-L12) `Mutex.protect` | `unlock mutex` then `raise exn` | safe today, only by luck | ~40 callers (scheduler `async_io`, `thread_safe_channel`, `inotify`, `fsevents`, `dune_trace/out`, `alloc`). A skipped unlock would deadlock the owning worker thread, not the build — and only on a `Stack_overflow` inside the (tiny) critical section, after which the process is unwinding to death. Unnoticed today; a real deadlock risk the moment a recoverable asynchronous exception enters scope. |
 | [`core.ml:497-509`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509) `Fiber.finalize` / [`fiber.ml:35`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/fiber.ml#L35) `Fiber.protect` | run `finally` fiber, reraise collected errors | safe today, only by luck | The fiber-level clean-up behind process cleanup ([`process.ml:247-253`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/process.ml#L247-L253)), sandbox destroy ([`sandbox.ml:510`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_engine/sandbox.ml#L510)), RPC session close, build-loop cleanup, timeout-task cancel ([`scheduler.ml:502`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_scheduler/scheduler.ml#L502)). An asynchronous `Stack_overflow` bypasses `core.ml:84` `apply`'s `with exn ->`, so it never enters the fiber error machinery and **no `~finally` runs** — leaked sandbox dir / unreaped child / undeleted temp. Unnoticed today because it co-occurs with process death; the scheduler's own `kill_and_wait_for_all_processes` + `at_exit` temp cleanup are the actual backstops (see below). |
 | [`dune_threaded_console.ml:89-154`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_threaded_console/dune_threaded_console.ml#L89-L154) console event loop | `| exn -> Mutex.lock; cleanup (Some exn)` (re-acquire mutex, unlock, broadcast `finish_cv`) | safe today, only by luck (low severity) | Runs in a dedicated console thread; `render`/`handle_user_events` are shallow so `Stack_overflow` is improbable, and the clean-up it would skip (unlock + `Condition.broadcast finish_cv`) only matters for orderly shutdown of a thread that is itself dying. Diagnostic/UI bookkeeping, no soundness or build-result impact. |
 
-(There are **no** `Fun.protect` uses and **no** hand-rolled `match … with exception
-e -> cleanup; raise e` outside the helpers above — dune funnels all clean-up
-through these, which is convenient: fixing the helpers fixes the callers.)
+(The standard-library `Fun.protect` is used in two spots — `read_directory_with_kinds_exn`
+([`readdir.ml:65-86`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/readdir.ml#L65-L86))
+and `read_directory_exn`
+([`readdir.ml:95-104`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/readdir.ml#L95-L104)),
+both for a `Unix.closedir` clean-up — and it has the same fragility: its `~finally`
+is run via an ordinary handler that an asynchronous `Stack_overflow` bypasses, leaking
+the open directory handle. There is otherwise **no** hand-rolled `match … with
+exception e -> cleanup; raise e` outside the helpers above — dune funnels essentially
+all clean-up through these few helpers, which is convenient: fixing the helpers fixes
+the callers.)
 
 ## Why this is subtle
 
@@ -316,8 +324,12 @@ every caller.
   raise.
 - **`Sys.Break`** — not used anywhere in dune's own code (only in the vendored
   `opam`/`notty` copies, which are out of scope: 3rd-party code under `vendor/`).
-- **No `Fun.protect`** anywhere; clean-up is funnelled through the four helpers
-  above.
+- **`Fun.protect`** is used in two production spots
+  ([`readdir.ml:65`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/readdir.ml#L65-L86),
+  [`readdir.ml:95`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/readdir.ml#L95-L104))
+  for `Unix.closedir` clean-up; same fragility as the helpers below (it is a fifth
+  clean-up primitive, not just an inherited caller). Everything else is funnelled
+  through the helpers above.
 
 ## Recommendations
 
@@ -333,7 +345,7 @@ is preserving daemon-mode crash-recovery.
    dune has a real behaviour change; pair it with (1) so per-build resources are
    actually released on the way out.
 
-1. **Make the four clean-up helpers interruption-safe (the bulk of the structural
+1. **Make the clean-up helpers interruption-safe (the bulk of the structural
    work).** Reimplement `Exn.protectx`/`protect` ([`exn.ml:9`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/exn.ml#L9-L19)),
    `Mutex.protect` ([`mutex0.ml:3`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/mutex0.ml#L3-L12)),
    and `Fiber.finalize`/`Fiber.protect` ([`core.ml:497`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/fiber/src/core.ml#L497-L509),
@@ -342,8 +354,12 @@ is preserving daemon-mode crash-recovery.
    when an asynchronous exception unwinds. Have them re-throw the interruption
    unchanged, **not** turn it back into an ordinary exception — turning it back
    would re-enable downstream catch-everything swallowing of a future asynchronous
-   `Sys.Break`. This single change covers all ~40 call sites without touching them.
-   Also harden the threaded-console loop
+   `Sys.Break`. This single change covers ~28 `Exn.protect`/`protectx` call sites and
+   ~40 `Mutex.protect` call sites without touching them. Also convert the two
+   standard-library `Fun.protect` uses in `readdir.ml`
+   ([`readdir.ml:65`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/readdir.ml#L65-L86),
+   [`readdir.ml:95`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/otherlibs/stdune/src/readdir.ml#L95-L104))
+   and harden the threaded-console loop
    ([`dune_threaded_console.ml:89`](https://github.com/ocaml/dune/blob/4d89cd6d5f6246996db8c4c12ae5d0ee77836a15/src/dune_threaded_console/dune_threaded_console.ml#L89-L154)).
 
 2. **Decide where to put the top-level wrapper (the one design call).** Optionally
