@@ -62,6 +62,14 @@ where it catches them.
   "delete the half-written file" handler (`library.ml`), and the diagnostic
   timing/`-time` wrappers. None corrupt logical state; the `.vo` one is the only
   externally-visible one.
+- **The bytecode VM (`vm_compute`) is a C interpreter with its own machine state,
+  and it is its own analysis surface.** It already polls for interrupts at a
+  controlled point and resets its own stack before raising, so the new model — which
+  stops asynchronous exceptions from escaping an allocation made by C code — actually
+  *removes* a latent corruption hazard. The one thing to check is that it re-raises a
+  caught Ctrl+C as an *ordinary* exception (`caml_raise`), which under the new rules
+  would re-open the "caught in the wrong place" hole for interrupts that land during VM
+  reduction. See "The bytecode VM" below.
 - Everything else checked (`Stack_overflow`/`Out_of_memory` recovery,
   finalisers, memprof callbacks, other signals, the `noncritical` discipline,
   the checker `coqchk`) is clear.
@@ -161,6 +169,22 @@ Each long-lived mode catches everything (including today's asynchronous
   Today that catch-all is exactly what lets the prompt survive a Ctrl+C and
   print "User interrupt." Under the new rules an asynchronous `Sys.Break` walks
   straight past `| any ->` and (with no wrapper) terminates the prompt.
+
+  **Real-world confirmation:** [rocq-prover/rocq#22023](https://github.com/rocq-prover/rocq/issues/22023)
+  ("Rocq 9.2 REPL sometimes fails to catch Ctrl-C") is a *current* (stock OCaml) instance
+  of this exact fragility: Ctrl+C at startup crashes with `Fatal error: exception
+  Stdlib.Sys.Break`, and after one command it works once then crashes again — the REPL
+  "doesn't catch the `Sys.Break` raised on Ctrl-C in all cases." Because `Sys.catch_break`
+  already makes `Sys.Break` asynchronous, an interrupt landing on a line *outside* this
+  `try … with` escapes uncaught. The fix, [#22030](https://github.com/rocq-prover/rocq/pull/22030),
+  moves `resynch_buffer` *inside* `read_and_execute`'s `try … with` so the break is caught
+  — i.e. it widens the ordinary handler to cover the gap. That fix works under stock
+  semantics but **would stop working under OxCaml** (an ordinary `with` no longer catches
+  an asynchronous `Sys.Break`); the OxCaml-correct fix is a `Sys.with_async_exns` boundary
+  around the per-command step, which also *eliminates this whole bug class* — the break is
+  delivered to the boundary rather than to whatever line was executing, so there is no
+  "uncovered sliver" left to crash on. (The startup-before-the-loop window in #22023 still
+  needs the boundary established early — the "where to place it" design call below.)
 - **Editor/IDE backend (`rocqide` document manager).** Its own `SIGINT`
   handler raises `Sys.Break` directly while a request is being evaluated
   ([`ide/rocqide/idetop.ml#L39-L42`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/ide/rocqide/idetop.ml#L39-L42)):
@@ -257,6 +281,65 @@ reliance on getting the `is_async` test right. (The timeout flavour of this is
 covered by the `unix_timeout` analysis above: a `Timeout` is already converted
 to a result inside `Control.timeout`, then surfaced as the ordinary
 `CmdTimeout`, [`vernac/vernacControl.ml#L130-L148`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/vernac/vernacControl.ml#L130-L148).)
+
+### The bytecode VM (`vm_compute`) — a C interpreter with its own machine state
+
+Rocq type-checks by reducing terms, and for speed it has its own bytecode virtual
+machine: a C interpreter in `kernel/byterun/` (`rocq_interp.c`, `rocq_memory.c`),
+driven from [`kernel/vm.ml`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/vm.ml#L41-L66)
+and `vconv.ml`. It is separate from OCaml's own bytecode interpreter because it must
+reduce *open* terms (free variables become "accumulators"), reduce under binders, and
+read the result back into kernel syntax. It reuses OCaml's heap and garbage collector,
+but runs on its **own separately-allocated stack** — `rocq_stack_low/high/sp`, plain C
+globals in [`rocq_memory.c#L29-L39`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_memory.c#L29-L39).
+
+Three things make it relevant here:
+
+- It **allocates OCaml values as it runs** (`Alloc_small` / `caml_alloc_shr`,
+  [`rocq_interp.c#L35-L42`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L35-L42)),
+  so it interacts with the garbage collector.
+- It **deliberately polls the runtime for pending signals at a controlled point** —
+  the `check_stack` step calls `caml_process_pending_actions`
+  ([`rocq_interp.c#L611-L642`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L611-L642)).
+  This is where a Ctrl+C surfaces during reduction.
+- When an exception leaves the VM it **first resets its own stack pointer**
+  (`rocq_sp = rocq_stack_high`) and *then* raises
+  ([`rocq_interp.c#L135-L140`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L135-L140));
+  the comment reads *"If there is an asynchronous exception, we reset the vm."* So the
+  authors already account for an interrupt mid-reduction and reset the global VM stack so
+  the next call starts clean — this is a global invariant restored in C, which the
+  snapshot-rollback story above does not cover.
+
+What the change does to it:
+
+- **It removes a latent hazard.** Today a garbage collection triggered by one of the
+  VM's allocations can run a pending signal handler, so a Ctrl+C can be raised from
+  *inside an allocation* — a path that does **not** go through the "reset the VM stack"
+  code, so it would leave the global VM stack pointer mid-reduction and corrupt the next
+  VM call. Under the new rules, allocations do not raise asynchronous exceptions, so the
+  interrupt can only surface at the VM's explicit poll, where it is handled correctly.
+  This is exactly what the design doc's separate change — *"ensure asynchronous
+  exceptions can't happen from signal handlers in `caml_alloc` functions called by C"* —
+  is about. For the VM this is a net improvement.
+- **The one thing to check:** the VM re-raises a caught Ctrl+C as an *ordinary*
+  exception (plain `caml_raise`,
+  [`rocq_interp.c#L139`](https://github.com/rocq-prover/rocq/blob/1add672f8d81b00eb5e107dc3ce4fc200322ee5e/kernel/byterun/rocq_interp.c#L139)).
+  The point of the new model is that Ctrl+C stays asynchronous so an inner `try … with`
+  cannot wrongly catch it (the motivating false-proof bug). If the VM converts it back to
+  an ordinary exception at its poll, then for any interrupt that lands during VM reduction
+  an enclosing handler could catch it again — re-opening the hole on the VM path. The
+  re-raise should probably preserve the asynchronous form, with the `Sys.with_async_exns`
+  wrapper sitting in the OCaml code that drives reduction (`vconv.ml`/`vm.ml`). (This
+  depends on OxCaml runtime internals not inspected here — how a pending `Sys.Break` is
+  delivered through `caml_process_pending_actions`, and how `caml_raise` interacts with
+  the asynchronous path — so it is an item to verify, not a confirmed bug.)
+- The VM's **own** stack overflow is managed by the VM (it grows its stack via
+  `CHECK_STACK`/`realloc_rocq_stack`), so it is not OCaml's `Stack_overflow`, and the
+  interpreter is an iterative loop, so it does not itself hit OCaml's `Stack_overflow`
+  mid-reduction; that risk lives in the recursive readback/compilation, which is ordinary
+  OCaml. `native_compute`, the sibling fast-reduction backend, compiles terms to ordinary
+  native OCaml and so follows the normal model — and it is the canonical "slow
+  computation, Ctrl+C pressed here" case.
 
 ## Cleanup that could be skipped on an asynchronous exception
 
@@ -395,6 +478,13 @@ plus the explicit `Sys.with_async_exns` wrappers above.
   that `at_exit` runs on asynchronous-uncaught termination (so the final
   `flush_all` happens); and that the throwing-side change in `unix_timeout` plus
   the free `Sys.Break` from `Sys.catch_break` behave as the doc describes.
+- **Whether the bytecode VM's interrupt re-raise must change** (see "The bytecode
+  VM"). The VM catches a pending Ctrl+C at its poll and re-raises it with plain
+  `caml_raise`, which would convert it back to an ordinary exception. Confirm
+  against the runtime whether a pending `Sys.Break` is even delivered through
+  `caml_process_pending_actions` under the new model, and if so whether the VM
+  should re-raise on the asynchronous path to keep it from being caught in the
+  wrong place during reduction.
 
 ## Obviously fine (gaps checked and cleared)
 

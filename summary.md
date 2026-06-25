@@ -350,6 +350,14 @@ state-corruption bug was found; a few clean-up spots are safe today only by luck
 the compiled-file (`.vo`) writer, which currently leaves a truncated file at the final path if
 interrupted (no write-to-temp-then-rename) — and should move to the existing safe bracket.
 
+Rocq also has its own bytecode reduction machine (`vm_compute`) written in C, which is a
+separate analysis surface from the OCaml code. It already polls for interrupts at a controlled
+point and resets its own machine state before raising, so the new model — which stops
+interruptions from escaping an allocation made by C code — actually removes a latent corruption
+hazard there. The one thing to check is that the machine re-raises a caught Ctrl+C as an
+*ordinary* exception, which under the new rules would re-open the "caught in the wrong place"
+risk for interrupts that land mid-reduction; the re-raise should preserve the asynchronous form.
+
 ---
 
 ## Frama-C (the C analysis platform) — minor and mode-dependent: no batch bug, two real server-mode bugs

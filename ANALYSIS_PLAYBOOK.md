@@ -221,6 +221,30 @@ package; their *absence* is where the bugs are. They are also the fixes to recom
      the sync/Async build and false for the Lwt build of the *same* code. Find the
      `Make (…) (…)` instantiations (grep `Make (`, the `.mli`'s `type return`) and read
      each monad's `catch`. *(alcotest: same engine, three backends, different verdicts.)*
+   - **C stubs / FFI / embedded interpreters / native-codegen backends are their own
+     surface — the OCaml-level greps above miss them entirely.** If the package ships C
+     (`(foreign_stubs c …)` / `(c_names …)` in dune, `*.c`/`*.h` files, `external`
+     declarations) or generates-and-runs code, open it and check:
+     - **`caml_alloc*` / `Alloc_small` called from C.** An async exn raised from an
+       allocation can unwind out of the C routine, which is not exception-safe and may
+       leave the routine's own (often C-global) state inconsistent. The new model
+       *removes* this (allocations don't raise async exns — the doc's PR *"ensure
+       asynchronous exceptions can't happen from signal handlers in `caml_alloc` functions
+       called by C"*), but verify the C code doesn't *rely* on catching at an allocation.
+     - **`caml_process_pending_actions` / `caml_process_pending_signals` /
+       `caml_check_gc_interrupt`** — explicit interrupt-poll points in C. How the C code
+       **re-raises** matters: plain `caml_raise` converts an async `Sys.Break` back to an
+       *ordinary* exception at that point, which can re-open the "caught in the wrong
+       place" hole; an async-preserving re-raise is usually wanted.
+     - **Custom machine state in C globals** (a VM's own stack/registers, `*_sp`): a
+       mid-operation async exn can corrupt it unless the C code resets it on the way out.
+     - **Custom-block finalisers registered from C** (`caml_alloc_custom` with a finalize
+       fn) and **native-codegen backends** (generate OCaml/native code and run it — the
+       generated code is ordinary OCaml under the model, and a long-running generated
+       computation is a classic "Ctrl+C during slow computation" site).
+     Grep the C too: `caml_alloc`, `caml_process_pending`, `caml_check_gc_interrupt`,
+     `caml_raise`, `caml_callback`, `signal`. *(Rocq's `vm_compute` is a C bytecode VM that
+     does all of the above; missing it in the first pass is what prompted this item.)*
 
 7. **Determine boundary placement (the real design call).** `Sys.with_async_exns`
    converts async→normal *at the boundary*, bypassing every handler nested below it.
@@ -239,6 +263,18 @@ package; their *absence* is where the bugs are. They are also the fixes to recom
    uncaught exception?" — write a 2-line `.ml` and run it (`at_exit` *does* run, incl.
    on `Stack_overflow`, on stock OCaml 5.x). Flag anything needing the *OxCaml*
    runtime specifically as a separate confirmation.
+
+9. **Search the project's issue tracker — interrupt bugs are often already filed.**
+   Grep the GitHub/GitLab issues and PRs for `Sys.Break`, `Ctrl-C`/`Ctrl+C`, `interrupt`,
+   `SIGINT`, `timeout`, `Stack_overflow`, "fails to catch", "Fatal error". A program that
+   relies on catching `Sys.Break` in a loop usually *already* has bug reports where it
+   escaped uncaught — these pinpoint the exact fragile recovery site, confirm it's
+   load-bearing, and often show the maintainers' own fix (which is typically "widen the
+   ordinary `try … with`" — the stock-OCaml fix that the new model would *break*, and that
+   a `Sys.with_async_exns` boundary supersedes). *(Rocq #22023/#22030: Ctrl+C escaping a
+   sliver of `coqloop.ml`'s `read_and_execute` outside its `try … with` — a live instance
+   of the catch-side fragility, fixed on stock OCaml by widening the handler.)* Use
+   `gh`/`WebFetch` if available; note when the tracker isn't reachable.
 
 ## Key conceptual framings to include
 
@@ -345,3 +381,12 @@ grep -rni -e "Sys.Break" -e "set_signal" -e "Sys.signal" -e "setitimer" -e "Unix
 ```
 Then read each hit in context — the verdict is never in the grep line, it's in
 whether the skipped cleanup is observed (step 5).
+
+**Don't stop at OCaml.** If the package ships C (look for `*.c`, `(foreign_stubs c …)`,
+`external`), grep the stubs too (step 6's C/FFI item) — these are invisible to the grep
+above and can be a whole analysis surface of their own:
+```
+grep -rni -e "caml_alloc" -e "Alloc_small" -e "caml_process_pending" \
+  -e "caml_check_gc_interrupt" -e "caml_raise" -e "caml_callback" -e "signal" \
+  --include=*.c --include=*.h <srcdir>
+```
